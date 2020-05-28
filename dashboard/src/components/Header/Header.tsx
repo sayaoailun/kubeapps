@@ -24,7 +24,7 @@ interface IHeaderProps {
   setNamespace: (ns: string) => void;
   createNamespace: (ns: string) => Promise<boolean>;
   getNamespace: (ns: string) => void;
-  featureFlags: { reposPerNamespace: boolean };
+  featureFlags: { reposPerNamespace: boolean; operators: boolean };
 }
 
 interface IHeaderState {
@@ -34,7 +34,7 @@ interface IHeaderState {
 
 class Header extends React.Component<IHeaderProps, IHeaderState> {
   public static defaultProps = {
-    featureFlags: { reposPerNamespace: false },
+    featureFlags: { reposPerNamespace: false, operators: false },
   };
 
   // Defines the route
@@ -43,16 +43,17 @@ class Header extends React.Component<IHeaderProps, IHeaderState> {
       children: "Applications",
       exact: true,
       namespaced: true,
-      to: "/apps",
+      to: "apps",
     },
     {
       children: "Catalog",
-      to: "/catalog",
+      namespaced: true,
+      to: "catalog",
     },
     {
       children: "Service Instances (alpha)",
       namespaced: true,
-      to: "/services/instances",
+      to: "services/instances",
     },
   ];
 
@@ -148,6 +149,11 @@ class Header extends React.Component<IHeaderProps, IHeaderState> {
                       <li role="none">
                         <NavLink to="/config/brokers">Service Brokers</NavLink>
                       </li>
+                      {this.props.featureFlags.operators && (
+                        <li role="none">
+                          <NavLink to={`/ns/${namespace.current}/operators`}>Operators</NavLink>
+                        </li>
+                      )}
                     </ul>
                   </li>
                   <li>

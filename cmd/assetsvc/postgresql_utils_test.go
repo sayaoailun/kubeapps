@@ -68,9 +68,13 @@ func (f *fakePGManager) GetDB() dbutils.PostgresDB {
 	return nil
 }
 
+func (f *fakePGManager) GetKubeappsNamespace() string {
+	return "kubeapps"
+}
+
 func Test_NewPGManager(t *testing.T) {
 	config := datastore.Config{URL: "10.11.12.13:5432"}
-	_, err := newPGManager(config)
+	_, err := newPGManager(config, "kubeapps")
 	if err != nil {
 		t.Errorf("Found error %v", err)
 	}
@@ -87,11 +91,11 @@ func Test_PGgetChart(t *testing.T) {
 		Chart:   models.Chart{ID: "foo"},
 		RawIcon: iconB64,
 	}
-	m.On("QueryOne", &models.ChartIconString{}, "SELECT info FROM charts WHERE chart_id = $1", []interface{}{"foo"}).Run(func(args mock.Arguments) {
+	m.On("QueryOne", &models.ChartIconString{}, "SELECT info FROM charts WHERE repo_namespace = $1 AND chart_id = $2", []interface{}{"namespace", "foo"}).Run(func(args mock.Arguments) {
 		*args.Get(0).(*models.ChartIconString) = dbChart
 	})
 
-	chart, err := pg.getChart("foo")
+	chart, err := pg.getChart("namespace", "foo")
 	if err != nil {
 		t.Errorf("Found error %v", err)
 	}
@@ -116,11 +120,11 @@ func Test_PGgetChartVersion(t *testing.T) {
 			{Version: "2.0.0"},
 		},
 	}
-	m.On("QueryOne", &models.Chart{}, "SELECT info FROM charts WHERE chart_id = $1", []interface{}{"foo"}).Run(func(args mock.Arguments) {
+	m.On("QueryOne", &models.Chart{}, "SELECT info FROM charts WHERE repo_namespace = $1 AND chart_id = $2", []interface{}{"namespace", "foo"}).Run(func(args mock.Arguments) {
 		*args.Get(0).(*models.Chart) = dbChart
 	})
 
-	chart, err := pg.getChartVersion("foo", "1.0.0")
+	chart, err := pg.getChartVersion("namespace", "foo", "1.0.0")
 	if err != nil {
 		t.Errorf("Found error %v", err)
 	}
@@ -141,11 +145,11 @@ func Test_getChartFiles(t *testing.T) {
 	pg := postgresAssetManager{fpg}
 
 	expectedFiles := models.ChartFiles{ID: "foo"}
-	m.On("QueryOne", &models.ChartFiles{}, "SELECT info FROM files WHERE chart_files_id = $1", []interface{}{"foo"}).Run(func(args mock.Arguments) {
+	m.On("QueryOne", &models.ChartFiles{}, "SELECT info FROM files WHERE repo_namespace = $1 AND chart_files_id = $2", []interface{}{"namespace", "foo"}).Run(func(args mock.Arguments) {
 		*args.Get(0).(*models.ChartFiles) = expectedFiles
 	})
 
-	files, err := pg.getChartFiles("foo")
+	files, err := pg.getChartFiles("namespace", "foo")
 	if err != nil {
 		t.Errorf("Found error %v", err)
 	}
@@ -167,9 +171,9 @@ func Test_getChartWithFilters(t *testing.T) {
 		},
 	}
 	chartsResponse = []*models.Chart{&dbChart}
-	m.On("QueryAllCharts", "SELECT info FROM charts WHERE info ->> 'name' = $1", []interface{}{"foo"})
+	m.On("QueryAllCharts", "SELECT info FROM charts WHERE repo_namespace = $1 AND info ->> 'name' = $2", []interface{}{"namespace", "foo"})
 
-	charts, err := pg.getChartsWithFilters("foo", "1.0.0", "1.0.1")
+	charts, err := pg.getChartsWithFilters("namespace", "foo", "1.0.0", "1.0.1")
 	if err != nil {
 		t.Errorf("Found error %v", err)
 	}
@@ -193,6 +197,7 @@ func Test_getPaginatedChartList(t *testing.T) {
 	}
 	tests := []struct {
 		name               string
+		namespace          string
 		repo               string
 		pageNumber         int
 		pageSize           int
@@ -200,8 +205,26 @@ func Test_getPaginatedChartList(t *testing.T) {
 		expectedCharts     []*models.Chart
 		expectedTotalPages int
 	}{
-		{"one page with duplicates with repo", "bitnami", 1, 100, true, availableCharts, 1},
-		{"one page withuot duplicates", "", 1, 100, false, []*models.Chart{availableCharts[0], availableCharts[1]}, 1},
+		{
+			name:               "one page with duplicates with repo",
+			namespace:          "other-namespace",
+			repo:               "bitnami",
+			pageNumber:         1,
+			pageSize:           100,
+			showDuplicates:     true,
+			expectedCharts:     availableCharts,
+			expectedTotalPages: 1,
+		},
+		{
+			name:               "one page withuot duplicates",
+			namespace:          "other-namespace",
+			repo:               "",
+			pageNumber:         1,
+			pageSize:           100,
+			showDuplicates:     false,
+			expectedCharts:     []*models.Chart{availableCharts[0], availableCharts[1]},
+			expectedTotalPages: 1,
+		},
 		// TODO(andresmgot): several pages
 	}
 	for _, tt := range tests {
@@ -211,13 +234,15 @@ func Test_getPaginatedChartList(t *testing.T) {
 			pg := postgresAssetManager{fpg}
 
 			chartsResponse = availableCharts
-			expectedQuery := ""
+			expectedQuery := "WHERE (repo_namespace = $1 OR repo_namespace = $2)"
+			expectedParams := []interface{}{"other-namespace", "kubeapps"}
 			if tt.repo != "" {
-				expectedQuery = fmt.Sprintf("WHERE info -> 'repo' ->> 'name' = '%s'", tt.repo)
+				expectedQuery = expectedQuery + " AND repo_name = $3"
+				expectedParams = append(expectedParams, "bitnami")
 			}
 			expectedQuery = fmt.Sprintf("SELECT info FROM %s %s ORDER BY info ->> 'name' ASC", dbutils.ChartTable, expectedQuery)
-			m.On("QueryAllCharts", expectedQuery, []interface{}(nil))
-			charts, totalPages, err := pg.getPaginatedChartList(tt.repo, tt.pageNumber, tt.pageSize, tt.showDuplicates)
+			m.On("QueryAllCharts", expectedQuery, expectedParams)
+			charts, totalPages, err := pg.getPaginatedChartList(tt.namespace, tt.repo, tt.pageNumber, tt.pageSize, tt.showDuplicates)
 			if err != nil {
 				t.Errorf("Found error %v", err)
 			}
@@ -227,29 +252,6 @@ func Test_getPaginatedChartList(t *testing.T) {
 			if !cmp.Equal(charts, tt.expectedCharts) {
 				t.Errorf("Unexpected result %v", cmp.Diff(charts, tt.expectedCharts))
 			}
-		})
-	}
-}
-
-func Test_searchCharts(t *testing.T) {
-	tests := []struct {
-		name          string
-		query         string
-		repo          string
-		expectedQuery string
-	}{
-		{"without repo", "foo", "", "SELECT info FROM charts WHERE  (info ->> 'name' ~ $1) OR (info ->> 'description' ~ $1) OR (info -> 'repo' ->> 'name' ~ $1) OR (info ->> 'keywords' ~ $1)OR (info ->> 'sources' ~ $1)OR (info ->> 'maintainers' ~ $1)"},
-		{"with repo", "foo", "bar", "SELECT info FROM charts WHERE info -> 'repo' ->> 'name' = 'bar' AND (info ->> 'name' ~ $1) OR (info ->> 'description' ~ $1) OR (info -> 'repo' ->> 'name' ~ $1) OR (info ->> 'keywords' ~ $1)OR (info ->> 'sources' ~ $1)OR (info ->> 'maintainers' ~ $1)"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := &mock.Mock{}
-			fpg := &fakePGManager{m}
-			pg := postgresAssetManager{fpg}
-
-			m.On("QueryAllCharts", tt.expectedQuery, []interface{}{tt.query})
-			pg.searchCharts(tt.query, tt.repo)
-			m.AssertExpectations(t)
 		})
 	}
 }

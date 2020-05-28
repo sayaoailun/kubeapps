@@ -17,9 +17,11 @@ limitations under the License.
 package kube
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strings"
 
@@ -93,17 +95,30 @@ type userHandler struct {
 	clientset combinedClientsetInterface
 }
 
+// ValidationResponse represents the response after validating a repo
+type ValidationResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// This interface is explicitly private so that it cannot be used in function
+// args, so that call-sites cannot accidentally pass a service handler in place
+// of a user handler.
+// TODO(mnelson): We could instead just create a UserHandler interface which embeds
+// this one and adds one method, to force call-sites to explicitly use a UserHandler
+// or ServiceHandler.
 type handler interface {
 	CreateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*v1alpha1.AppRepository, error)
+	UpdateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*v1alpha1.AppRepository, error)
 	DeleteAppRepository(name, namespace string) error
 	GetNamespaces() ([]corev1.Namespace, error)
 	GetSecret(name, namespace string) (*corev1.Secret, error)
 	GetAppRepository(repoName, repoNamespace string) (*v1alpha1.AppRepository, error)
-	ValidateAppRepository(appRepoBody io.ReadCloser) (*http.Response, error)
+	ValidateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*ValidationResponse, error)
 	GetOperatorLogo(namespace, name string) ([]byte, error)
 }
 
-// AuthHandler exposes handler functionality as a user or the current serviceaccount
+// AuthHandler exposes Handler functionality as a user or the current serviceaccount
 type AuthHandler interface {
 	AsUser(token string) handler
 	AsSVC() handler
@@ -139,9 +154,14 @@ type appRepositoryRequestDetails struct {
 	RepoURL            string                 `json:"repoURL"`
 	AuthHeader         string                 `json:"authHeader"`
 	CustomCA           string                 `json:"customCA"`
+	RegistrySecrets    []string               `json:"registrySecrets"`
 	SyncJobPodTemplate corev1.PodTemplateSpec `json:"syncJobPodTemplate"`
 	ResyncRequests     uint                   `json:"resyncRequests"`
 }
+
+// ErrGlobalRepositoryWithSecrets defines the error returned when an attempt is
+// made to create registry secrets for a global repo.
+var ErrGlobalRepositoryWithSecrets = fmt.Errorf("docker registry secrets cannot be set for app repositories available in all namespaces")
 
 // NewHandler returns an AppRepositories and Kubernetes handler configured with
 // the in-cluster config but overriding the token with an empty string, so that
@@ -215,17 +235,39 @@ func (a *kubeHandler) clientsetForRequest(token string) (combinedClientsetInterf
 	return clientset, err
 }
 
-func parseRepoAndSecret(appRepoBody io.ReadCloser) (*v1alpha1.AppRepository, *corev1.Secret, error) {
+func parseRepoRequest(appRepoBody io.ReadCloser) (*appRepositoryRequest, error) {
 	var appRepoRequest appRepositoryRequest
 	err := json.NewDecoder(appRepoBody).Decode(&appRepoRequest)
 	if err != nil {
 		log.Infof("unable to decode: %v", err)
-		return nil, nil, err
+		return nil, err
+	}
+	return &appRepoRequest, nil
+}
+
+func (a *userHandler) applyAppRepositorySecret(repoSecret *corev1.Secret, requestNamespace string, appRepo *v1alpha1.AppRepository) error {
+	// TODO: pass request context through from user request to clientset.
+	_, err := a.clientset.CoreV1().Secrets(requestNamespace).Create(context.TODO(), repoSecret, metav1.CreateOptions{})
+	if err != nil && k8sErrors.IsAlreadyExists(err) {
+		_, err = a.clientset.CoreV1().Secrets(requestNamespace).Update(context.TODO(), repoSecret, metav1.UpdateOptions{})
+	}
+	if err != nil {
+		return err
 	}
 
-	appRepo := appRepositoryForRequest(appRepoRequest)
-	repoSecret := secretForRequest(appRepoRequest, appRepo)
-	return appRepo, repoSecret, nil
+	// TODO(#1647): Move app repo sync to namespaces so secret copy not required.
+	if requestNamespace != a.kubeappsNamespace {
+		repoSecret.ObjectMeta.Name = KubeappsSecretNameForRepo(appRepo.ObjectMeta.Name, appRepo.ObjectMeta.Namespace)
+		repoSecret.ObjectMeta.OwnerReferences = nil
+		_, err = a.svcClientset.CoreV1().Secrets(a.kubeappsNamespace).Create(context.TODO(), repoSecret, metav1.CreateOptions{})
+		if err != nil && k8sErrors.IsAlreadyExists(err) {
+			_, err = a.clientset.CoreV1().Secrets(a.kubeappsNamespace).Update(context.TODO(), repoSecret, metav1.UpdateOptions{})
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateAppRepository creates an AppRepository resource based on the request data
@@ -235,38 +277,74 @@ func (a *userHandler) CreateAppRepository(appRepoBody io.ReadCloser, requestName
 		return nil, fmt.Errorf("kubeappsNamespace must be configured to enable app repository handler")
 	}
 
-	appRepo, repoSecret, err := parseRepoAndSecret(appRepoBody)
+	appRepoRequest, err := parseRepoRequest(appRepoBody)
 	if err != nil {
 		return nil, err
 	}
 
-	appRepo, err = a.clientset.KubeappsV1alpha1().AppRepositories(requestNamespace).Create(appRepo)
+	appRepo := appRepositoryForRequest(appRepoRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(appRepo.Spec.DockerRegistrySecrets) > 0 && requestNamespace == a.kubeappsNamespace {
+		return nil, ErrGlobalRepositoryWithSecrets
+	}
+
+	appRepo, err = a.clientset.KubeappsV1alpha1().AppRepositories(requestNamespace).Create(context.TODO(), appRepo, metav1.CreateOptions{})
 
 	if err != nil {
 		return nil, err
 	}
 
+	repoSecret := secretForRequest(appRepoRequest, appRepo)
 	if repoSecret != nil {
-		_, err = a.clientset.CoreV1().Secrets(requestNamespace).Create(repoSecret)
+		a.applyAppRepositorySecret(repoSecret, requestNamespace, appRepo)
 		if err != nil {
 			return nil, err
 		}
-		// If the namespace isn't kubeapps (ie. this is a per-namespace
-		// AppRepository), save a copy of the repository secret in kubeapps
-		// namespace using the service account clientset. This enables the
-		// existing assetsync service to be able to sync private
-		// AppRepositories in other namespaces. It is not ideal and is a
-		// temporary work-around until the asset-sync is updated to run
-		// cronjobs in other namespaces with the assetsvc receiving the data.
-		// See the relevant section of the design doc for details:
-		// https://docs.google.com/document/d/1YEeKC6nPLoq4oaxs9v8_UsmxrRfWxB6KCyqrh2-Q8x0/edit?ts=5e2adf87#heading=h.kilvd2vii0w
-		if requestNamespace != a.kubeappsNamespace {
-			repoSecret.ObjectMeta.Name = KubeappsSecretNameForRepo(appRepo.ObjectMeta.Name, appRepo.ObjectMeta.Namespace)
-			repoSecret.ObjectMeta.OwnerReferences = nil
-			_, err = a.svcClientset.CoreV1().Secrets(a.kubeappsNamespace).Create(repoSecret)
-			if err != nil {
-				return nil, err
-			}
+	}
+	return appRepo, nil
+}
+
+// UpdateAppRepository updates an AppRepository resource based on the request data
+func (a *userHandler) UpdateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*v1alpha1.AppRepository, error) {
+	if a.kubeappsNamespace == "" {
+		log.Errorf("attempt to use app repositories handler without kubeappsNamespace configured")
+		return nil, fmt.Errorf("kubeappsNamespace must be configured to enable app repository handler")
+	}
+
+	appRepoRequest, err := parseRepoRequest(appRepoBody)
+	if err != nil {
+		return nil, err
+	}
+
+	appRepo := appRepositoryForRequest(appRepoRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(appRepo.Spec.DockerRegistrySecrets) > 0 && requestNamespace == a.kubeappsNamespace {
+		return nil, ErrGlobalRepositoryWithSecrets
+	}
+
+	existingAppRepo, err := a.clientset.KubeappsV1alpha1().AppRepositories(requestNamespace).Get(context.TODO(), appRepo.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Update existing repo with the new spec
+	existingAppRepo.Spec = appRepo.Spec
+	appRepo, err = a.clientset.KubeappsV1alpha1().AppRepositories(requestNamespace).Update(context.TODO(), existingAppRepo, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	repoSecret := secretForRequest(appRepoRequest, appRepo)
+	if repoSecret != nil {
+		a.applyAppRepositorySecret(repoSecret, requestNamespace, appRepo)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return appRepo, nil
@@ -274,12 +352,12 @@ func (a *userHandler) CreateAppRepository(appRepoBody io.ReadCloser, requestName
 
 // DeleteAppRepository deletes an AppRepository resource from a namespace.
 func (a *userHandler) DeleteAppRepository(repoName, repoNamespace string) error {
-	appRepo, err := a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Get(repoName, metav1.GetOptions{})
+	appRepo, err := a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Get(context.TODO(), repoName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 	hasCredentials := appRepo.Spec.Auth.Header != nil || appRepo.Spec.Auth.CustomCA != nil
-	err = a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Delete(repoName, &metav1.DeleteOptions{})
+	err = a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Delete(context.TODO(), repoName, metav1.DeleteOptions{})
 	if err != nil {
 		return err
 	}
@@ -288,17 +366,28 @@ func (a *userHandler) DeleteAppRepository(repoName, repoNamespace string) error 
 	// the repository credentials kept in the kubeapps namespace (the repo credentials in the actual
 	// namespace should be deleted when the owning app repo is deleted).
 	if hasCredentials && repoNamespace != a.kubeappsNamespace {
-		err = a.clientset.CoreV1().Secrets(a.kubeappsNamespace).Delete(KubeappsSecretNameForRepo(repoName, repoNamespace), &metav1.DeleteOptions{})
+		err = a.clientset.CoreV1().Secrets(a.kubeappsNamespace).Delete(context.TODO(), KubeappsSecretNameForRepo(repoName, repoNamespace), metav1.DeleteOptions{})
 	}
 	return err
 }
 
-func getValidationCliAndReq(appRepoBody io.ReadCloser) (HTTPClient, *http.Request, error) {
-	appRepo, repoSecret, err := parseRepoAndSecret(appRepoBody)
+func getValidationCliAndReq(appRepoBody io.ReadCloser, requestNamespace, kubeappsNamespace string) (HTTPClient, *http.Request, error) {
+	appRepoRequest, err := parseRepoRequest(appRepoBody)
 	if err != nil {
 		return nil, nil, err
 	}
-	fmt.Println(repoSecret)
+
+	appRepo := appRepositoryForRequest(appRepoRequest)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(appRepo.Spec.DockerRegistrySecrets) > 0 && requestNamespace == kubeappsNamespace {
+		// TODO(mnelson): we may also want to validate that any docker registry secrets listed
+		// already exist in the namespace.
+		return nil, nil, ErrGlobalRepositoryWithSecrets
+	}
+
+	repoSecret := secretForRequest(appRepoRequest, appRepo)
 	cli, err := InitNetClient(appRepo, repoSecret, repoSecret, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Unable to create HTTP client: %w", err)
@@ -311,23 +400,36 @@ func getValidationCliAndReq(appRepoBody io.ReadCloser) (HTTPClient, *http.Reques
 	return cli, req, nil
 }
 
-func (a *userHandler) ValidateAppRepository(appRepoBody io.ReadCloser) (*http.Response, error) {
+func doValidationRequest(cli HTTPClient, req *http.Request) (*ValidationResponse, error) {
+	res, err := cli.Do(req)
+	if err != nil {
+		// If the request fail, it's not an internal error
+		return &ValidationResponse{Code: 400, Message: err.Error()}, nil
+	}
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to parse validation response. Got: %v", err)
+	}
+	return &ValidationResponse{Code: res.StatusCode, Message: string(body)}, nil
+}
+
+func (a *userHandler) ValidateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*ValidationResponse, error) {
 	// Split body parsing to a different function for ease testing
-	cli, req, err := getValidationCliAndReq(appRepoBody)
+	cli, req, err := getValidationCliAndReq(appRepoBody, requestNamespace, a.kubeappsNamespace)
 	if err != nil {
 		return nil, err
 	}
-	return cli.Do(req)
+	return doValidationRequest(cli, req)
 }
 
 // GetAppRepository returns an AppRepository resource from a namespace.
 // Optionally set a token to get the AppRepository using a custom serviceaccount
 func (a *userHandler) GetAppRepository(repoName, repoNamespace string) (*v1alpha1.AppRepository, error) {
-	return a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Get(repoName, metav1.GetOptions{})
+	return a.clientset.KubeappsV1alpha1().AppRepositories(repoNamespace).Get(context.TODO(), repoName, metav1.GetOptions{})
 }
 
 // appRepositoryForRequest takes care of parsing the request data into an AppRepository.
-func appRepositoryForRequest(appRepoRequest appRepositoryRequest) *v1alpha1.AppRepository {
+func appRepositoryForRequest(appRepoRequest *appRepositoryRequest) *v1alpha1.AppRepository {
 	appRepo := appRepoRequest.AppRepository
 
 	var auth v1alpha1.AppRepositoryAuth
@@ -360,17 +462,18 @@ func appRepositoryForRequest(appRepoRequest appRepositoryRequest) *v1alpha1.AppR
 			Name: appRepo.Name,
 		},
 		Spec: v1alpha1.AppRepositorySpec{
-			URL:                appRepo.RepoURL,
-			Type:               "helm",
-			Auth:               auth,
-			SyncJobPodTemplate: appRepo.SyncJobPodTemplate,
-			ResyncRequests:     appRepo.ResyncRequests,
+			URL:                   appRepo.RepoURL,
+			Type:                  "helm",
+			Auth:                  auth,
+			DockerRegistrySecrets: appRepo.RegistrySecrets,
+			SyncJobPodTemplate:    appRepo.SyncJobPodTemplate,
+			ResyncRequests:        appRepo.ResyncRequests,
 		},
 	}
 }
 
 // secretForRequest takes care of parsing the request data into a secret for an AppRepository.
-func secretForRequest(appRepoRequest appRepositoryRequest, appRepo *v1alpha1.AppRepository) *corev1.Secret {
+func secretForRequest(appRepoRequest *appRepositoryRequest, appRepo *v1alpha1.AppRepository) *corev1.Secret {
 	appRepoDetails := appRepoRequest.AppRepository
 	secrets := map[string]string{}
 	if appRepoDetails.AuthHeader != "" {
@@ -414,7 +517,7 @@ func KubeappsSecretNameForRepo(repoName, namespace string) string {
 func filterAllowedNamespaces(userClientset combinedClientsetInterface, namespaces *corev1.NamespaceList) ([]corev1.Namespace, error) {
 	allowedNamespaces := []corev1.Namespace{}
 	for _, namespace := range namespaces.Items {
-		res, err := userClientset.AuthorizationV1().SelfSubjectAccessReviews().Create(&authorizationapi.SelfSubjectAccessReview{
+		res, err := userClientset.AuthorizationV1().SelfSubjectAccessReviews().Create(context.TODO(), &authorizationapi.SelfSubjectAccessReview{
 			Spec: authorizationapi.SelfSubjectAccessReviewSpec{
 				ResourceAttributes: &authorizationapi.ResourceAttributes{
 					Group:     "",
@@ -423,7 +526,7 @@ func filterAllowedNamespaces(userClientset combinedClientsetInterface, namespace
 					Namespace: namespace.Name,
 				},
 			},
-		})
+		}, metav1.CreateOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -437,11 +540,11 @@ func filterAllowedNamespaces(userClientset combinedClientsetInterface, namespace
 // GetNamespaces return the list of namespaces that the user has permission to access
 func (a *userHandler) GetNamespaces() ([]corev1.Namespace, error) {
 	// Try to list namespaces with the user token, for backward compatibility
-	namespaces, err := a.clientset.CoreV1().Namespaces().List(metav1.ListOptions{})
+	namespaces, err := a.clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		if k8sErrors.IsForbidden(err) {
 			// The user doesn't have permissions to list namespaces, use the current serviceaccount
-			namespaces, err = a.svcClientset.CoreV1().Namespaces().List(metav1.ListOptions{})
+			namespaces, err = a.svcClientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 		}
 		if err != nil {
 			return nil, err
@@ -458,10 +561,10 @@ func (a *userHandler) GetNamespaces() ([]corev1.Namespace, error) {
 
 // GetSecret return the a secret from a namespace using a token if given
 func (a *userHandler) GetSecret(name, namespace string) (*corev1.Secret, error) {
-	return a.clientset.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+	return a.clientset.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 }
 
 // GetNamespaces return the list of namespaces that the user has permission to access
 func (a *userHandler) GetOperatorLogo(namespace, name string) ([]byte, error) {
-	return a.clientset.RestClient().Get().AbsPath(fmt.Sprintf("/apis/packages.operators.coreos.com/v1/namespaces/%s/packagemanifests/%s/icon", namespace, name)).Do().Raw()
+	return a.clientset.RestClient().Get().AbsPath(fmt.Sprintf("/apis/packages.operators.coreos.com/v1/namespaces/%s/packagemanifests/%s/icon", namespace, name)).Do(context.TODO()).Raw()
 }

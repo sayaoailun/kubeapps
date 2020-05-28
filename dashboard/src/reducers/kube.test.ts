@@ -13,6 +13,7 @@ describe("authReducer", () => {
     errorKube: getType(actions.kube.receiveResourceError),
     openWatchResource: getType(actions.kube.openWatchResource),
     closeWatchResource: getType(actions.kube.closeWatchResource),
+    receiveResourceFromList: getType(actions.kube.receiveResourceFromList),
   };
 
   const ref = new ResourceRef({
@@ -55,6 +56,40 @@ describe("authReducer", () => {
       expect(kubeReducer(undefined, { type, payload })).toEqual({
         ...initialState,
         items: { foo: { isFetching: false, error } },
+      });
+    });
+
+    it("receives an item from a list", () => {
+      const resource = {
+        metadata: { name: "foo", selfLink: "/foo" },
+        status: { ready: false },
+      } as IResource;
+      const payload = { key: "foo", resource: { ...resource, status: { ready: true } } };
+      const type = actionTypes.receiveResourceFromList as any;
+      const stateWithItems = {
+        ...initialState,
+        items: { foo: { isFetching: true, item: { items: [resource] } } },
+      } as any;
+      expect(kubeReducer(stateWithItems, { type, payload })).toEqual({
+        ...initialState,
+        items: { foo: { isFetching: false, item: { items: [payload.resource] } } },
+      });
+    });
+
+    it("receives an item when the list item is undefined", () => {
+      const resource = {
+        metadata: { name: "foo", selfLink: "/foo" },
+        status: { ready: false },
+      } as IResource;
+      const payload = { key: "foo", resource: { ...resource, status: { ready: true } } };
+      const type = actionTypes.receiveResourceFromList as any;
+      const stateWithItems = {
+        ...initialState,
+        items: { foo: { isFetching: true, item: undefined } },
+      } as any;
+      expect(kubeReducer(stateWithItems, { type, payload })).toEqual({
+        ...initialState,
+        items: { foo: { isFetching: false, item: { items: [payload.resource] } } },
       });
     });
 

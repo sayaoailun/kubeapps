@@ -1,6 +1,6 @@
 import { Kube } from "./Kube";
-import ResourceRef from "./ResourceRef";
-import { IResource } from "./types";
+import ResourceRef, { fromCRD } from "./ResourceRef";
+import { IClusterServiceVersionCRDResource, IResource } from "./types";
 
 describe("ResourceRef", () => {
   describe("constructor", () => {
@@ -37,18 +37,6 @@ describe("ResourceRef", () => {
       expect(ref.namespace).toBe("default");
     });
 
-    it("throws an error if namespace not in the resource or default namespace not set", () => {
-      const r = {
-        apiVersion: "apps/v1",
-        kind: "Deployment",
-        metadata: {
-          name: "foo",
-        },
-      } as IResource;
-
-      expect(() => new ResourceRef(r)).toThrowError();
-    });
-
     it("allows the default namespace to be provided", () => {
       const r = {
         apiVersion: "apps/v1",
@@ -60,6 +48,50 @@ describe("ResourceRef", () => {
 
       const ref = new ResourceRef(r, "bar");
       expect(ref.namespace).toBe("bar");
+    });
+
+    describe("fromCRD", () => {
+      it("creates a resource ref with ownerReference", () => {
+        const r = {
+          kind: "Deployment",
+          name: "",
+          version: "",
+        } as IClusterServiceVersionCRDResource;
+        const ownerRef = {
+          metadata: {
+            name: "test",
+          },
+        };
+        const res = fromCRD(r, "default", ownerRef);
+        expect(res).toMatchObject({
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          name: undefined,
+          namespace: "default",
+          filter: { metadata: { ownerReferences: [ownerRef] } },
+        });
+      });
+
+      it("skips the namespace for a non namespaced element", () => {
+        const r = {
+          kind: "ClusterRole",
+          name: "",
+          version: "",
+        } as IClusterServiceVersionCRDResource;
+        const ownerRef = {
+          metadata: {
+            name: "test",
+          },
+        };
+        const res = fromCRD(r, "default", ownerRef);
+        expect(res).toMatchObject({
+          apiVersion: "rbac.authorization.k8s.io/v1",
+          kind: "ClusterRole",
+          name: undefined,
+          namespace: "",
+          filter: { metadata: { ownerReferences: [ownerRef] } },
+        });
+      });
     });
   });
 
@@ -118,7 +150,9 @@ describe("ResourceRef", () => {
   describe("getResource", () => {
     let kubeGetResourceMock: jest.Mock;
     beforeEach(() => {
-      kubeGetResourceMock = jest.fn();
+      kubeGetResourceMock = jest.fn(() => {
+        return { metadata: { name: "foo" } };
+      });
       Kube.getResource = kubeGetResourceMock;
     });
     afterEach(() => {
@@ -138,6 +172,25 @@ describe("ResourceRef", () => {
 
       ref.getResource();
       expect(kubeGetResourceMock).toBeCalledWith("v1", "services", "bar", "foo");
+    });
+
+    it("filters out the result when receiving a list", async () => {
+      const r = {
+        apiVersion: "v1",
+        kind: "Service",
+        metadata: {
+          name: "foo",
+          namespace: "bar",
+        },
+      } as IResource;
+
+      const ref = new ResourceRef(r);
+      ref.filter = { metadata: { name: "bar" } };
+      Kube.getResource = jest.fn(() => {
+        return { items: [r] };
+      });
+      const res = await ref.getResource();
+      expect(res).toEqual({ items: [] });
     });
   });
 

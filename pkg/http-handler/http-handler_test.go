@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -34,6 +35,42 @@ import (
 
 	v1alpha1 "github.com/kubeapps/kubeapps/cmd/apprepository-controller/pkg/apis/apprepository/v1alpha1"
 )
+
+func checkAppResponse(t *testing.T, response *httptest.ResponseRecorder, expectedRepo *v1alpha1.AppRepository) {
+	var appRepoResponse appRepositoryResponse
+	err := json.NewDecoder(response.Body).Decode(&appRepoResponse)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	expectedResponse := appRepositoryResponse{AppRepository: *expectedRepo}
+	if got, want := appRepoResponse, expectedResponse; !cmp.Equal(want, got) {
+		t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
+	}
+}
+
+func checkError(t *testing.T, response *httptest.ResponseRecorder, expectedError error) {
+	if response.Code == 500 {
+		// If the error is a 500 we simply retunr a string (encoded in JSON)
+		var errMsg string
+		err := json.NewDecoder(response.Body).Decode(&errMsg)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if got, want := errMsg, expectedError.Error(); got != want {
+			t.Errorf("got: %q, want: %q", got, want)
+		}
+	} else {
+		// The error should be a kubernetes error response.
+		var status metav1.Status
+		err := json.NewDecoder(response.Body).Decode(&status)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		if got, want := status, expectedError.(*k8sErrors.StatusError).ErrStatus; !cmp.Equal(want, got) {
+			t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
+		}
+	}
+}
 
 func TestCreateAppRepository(t *testing.T) {
 	testCases := []struct {
@@ -57,6 +94,11 @@ func TestCreateAppRepository(t *testing.T) {
 			err:          k8sErrors.NewConflict(schema.GroupResource{}, "foo", fmt.Errorf("already exists")),
 			expectedCode: 409,
 		},
+		{
+			name:         "it returns a json 500 error as a plain string for internal backend errors",
+			err:          fmt.Errorf("bang"),
+			expectedCode: 500,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,15 +114,54 @@ func TestCreateAppRepository(t *testing.T) {
 			}
 
 			if response.Code == 201 {
-				var appRepoResponse appRepositoryResponse
-				err := json.NewDecoder(response.Body).Decode(&appRepoResponse)
-				if err != nil {
-					t.Fatalf("%+v", err)
-				}
-				expectedResponse := appRepositoryResponse{AppRepository: *tc.appRepo}
-				if got, want := appRepoResponse, expectedResponse; !cmp.Equal(want, got) {
-					t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
-				}
+				checkAppResponse(t, response, tc.appRepo)
+			} else {
+				checkError(t, response, tc.err)
+			}
+		})
+	}
+}
+
+func TestUpdateAppRepository(t *testing.T) {
+	testCases := []struct {
+		name         string
+		appRepo      *v1alpha1.AppRepository
+		err          error
+		expectedCode int
+	}{
+		{
+			name:         "it should return the repo and a 200 if the repo is updated",
+			appRepo:      &v1alpha1.AppRepository{ObjectMeta: metav1.ObjectMeta{Name: "foo"}},
+			expectedCode: 200,
+		},
+		{
+			name:         "it should return a 404 if not found",
+			err:          k8sErrors.NewNotFound(schema.GroupResource{}, "foo"),
+			expectedCode: 404,
+		},
+		{
+			name:         "it returns a json 500 error as a plain string for internal backend errors",
+			err:          fmt.Errorf("bang"),
+			expectedCode: 500,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			createAppFunc := UpdateAppRepository(&kube.FakeHandler{UpdatedRepo: tc.appRepo, Err: tc.err})
+			req := httptest.NewRequest("POST", "https://foo.bar/backend/v1/namespaces/kubeapps/apprepositories/foo", strings.NewReader("data"))
+			req = mux.SetURLVars(req, map[string]string{"namespace": "kubeapps"})
+
+			response := httptest.NewRecorder()
+			createAppFunc(response, req)
+
+			if got, want := response.Code, tc.expectedCode; got != want {
+				t.Errorf("got: %d, want: %d\nBody: %s", got, want, response.Body)
+			}
+
+			if response.Code == 200 {
+				checkAppResponse(t, response, tc.appRepo)
+			} else {
+				checkError(t, response, tc.err)
 			}
 		})
 	}
@@ -170,23 +251,35 @@ func TestGetNamespaces(t *testing.T) {
 
 func TestValidateAppRepository(t *testing.T) {
 	testCases := []struct {
-		name         string
-		err          error
-		expectedCode int
+		name               string
+		err                error
+		validationResponse kube.ValidationResponse
+		expectedCode       int
+		expectedBody       string
 	}{
 		{
-			name:         "it should return OK if no error is detected",
-			expectedCode: 200,
+			name:               "it should return OK if no error is detected",
+			validationResponse: kube.ValidationResponse{Code: 200, Message: "OK"},
+			expectedCode:       200,
+			expectedBody:       `{"code":200,"message":"OK"}`,
 		},
 		{
-			name:         "it should return the error code if given",
-			err:          fmt.Errorf("Boom"),
-			expectedCode: 500,
+			name:               "it should return the error code if given",
+			err:                fmt.Errorf("Boom"),
+			validationResponse: kube.ValidationResponse{},
+			expectedCode:       500,
+			expectedBody:       "\"Boom\"\n",
+		},
+		{
+			name:               "it should return an error in the validation response",
+			validationResponse: kube.ValidationResponse{Code: 401, Message: "Forbidden"},
+			expectedCode:       200,
+			expectedBody:       `{"code":401,"message":"Forbidden"}`,
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			validateAppRepoFunc := ValidateAppRepository(&kube.FakeHandler{Err: tc.err})
+			validateAppRepoFunc := ValidateAppRepository(&kube.FakeHandler{ValRes: &tc.validationResponse, Err: tc.err})
 			req := httptest.NewRequest("POST", "https://foo.bar/backend/v1/namespaces/kubeapps/apprepositories/validate", strings.NewReader("data"))
 
 			response := httptest.NewRecorder()
@@ -194,6 +287,11 @@ func TestValidateAppRepository(t *testing.T) {
 
 			if got, want := response.Code, tc.expectedCode; got != want {
 				t.Errorf("got: %d, want: %d\nBody: %s", got, want, response.Body)
+			}
+
+			responseBody, _ := ioutil.ReadAll(response.Body)
+			if got, want := string(responseBody), tc.expectedBody; got != want {
+				t.Errorf("got: %s, want: %s\n", got, want)
 			}
 		})
 	}

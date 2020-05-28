@@ -69,7 +69,7 @@ func ListReleases(actionConfig *action.Configuration, namespace string, listLimi
 }
 
 // CreateRelease creates a release.
-func CreateRelease(actionConfig *action.Configuration, name, namespace, valueString string, ch *chart.Chart) (*release.Release, error) {
+func CreateRelease(actionConfig *action.Configuration, name, namespace, valueString string, ch *chart.Chart, registrySecrets map[string]string) (*release.Release, error) {
 	// Check if the release already exists
 	_, err := GetRelease(actionConfig, name)
 	if err == nil {
@@ -78,6 +78,10 @@ func CreateRelease(actionConfig *action.Configuration, name, namespace, valueStr
 	cmd := action.NewInstall(actionConfig)
 	cmd.ReleaseName = name
 	cmd.Namespace = namespace
+	cmd.PostRenderer, err = NewDockerSecretsPostRenderer(registrySecrets)
+	if err != nil {
+		return nil, err
+	}
 	values, err := getValues([]byte(valueString))
 	if err != nil {
 		return nil, err
@@ -95,7 +99,7 @@ func CreateRelease(actionConfig *action.Configuration, name, namespace, valueStr
 }
 
 // UpgradeRelease upgrades a release.
-func UpgradeRelease(actionConfig *action.Configuration, name, valuesYaml string, ch *chart.Chart) (*release.Release, error) {
+func UpgradeRelease(actionConfig *action.Configuration, name, valuesYaml string, ch *chart.Chart, registrySecrets map[string]string) (*release.Release, error) {
 	// Check if the release already exists:
 	_, err := GetRelease(actionConfig, name)
 	if err != nil {
@@ -103,6 +107,11 @@ func UpgradeRelease(actionConfig *action.Configuration, name, valuesYaml string,
 	}
 	log.Printf("Upgrading release %s", name)
 	cmd := action.NewUpgrade(actionConfig)
+
+	cmd.PostRenderer, err = NewDockerSecretsPostRenderer(registrySecrets)
+	if err != nil {
+		return nil, err
+	}
 	values, err := chartutil.ReadValues([]byte(valuesYaml))
 	if err != nil {
 		return nil, fmt.Errorf("Unable to upgrade the release because values could not be parsed: %v", err)

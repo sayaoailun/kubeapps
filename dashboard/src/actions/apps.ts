@@ -109,13 +109,21 @@ function getAppUpdateInfo(
   currentVersion: string,
   appVersion: string,
 ): ThunkAction<Promise<void>, IStoreState, null, AppsAction> {
-  return async dispatch => {
+  return async (dispatch, getState) => {
     dispatch(requestAppUpdateInfo());
+    const {
+      config: { namespace },
+    } = getState();
     try {
-      const chartsInfo = await Chart.listWithFilters(chartName, currentVersion, appVersion);
+      const chartsInfo = await Chart.listWithFilters(
+        namespace,
+        chartName,
+        currentVersion,
+        appVersion,
+      );
       let updateInfo: IChartUpdateInfo = {
         upToDate: true,
-        repository: { name: "", url: "" },
+        repository: { name: "", url: "", namespace: "" },
         chartLatestVersion: "",
         appLatestVersion: "",
       };
@@ -141,7 +149,7 @@ function getAppUpdateInfo(
       const updateInfo: IChartUpdateInfo = {
         error: e,
         upToDate: false,
-        repository: { name: "", url: "" },
+        repository: { name: "", url: "", namespace: "" },
         chartLatestVersion: "",
         appLatestVersion: "",
       };
@@ -151,8 +159,8 @@ function getAppUpdateInfo(
 }
 
 export function getAppWithUpdateInfo(
-  releaseName: string,
   namespace: string,
+  releaseName: string,
 ): ThunkAction<Promise<void>, IStoreState, null, AppsAction> {
   return async dispatch => {
     try {
@@ -240,6 +248,7 @@ export function fetchAppsWithUpdateInfo(
 
 export function deployChart(
   chartVersion: IChartVersion,
+  chartNamespace: string,
   releaseName: string,
   namespace: string,
   values?: string,
@@ -265,10 +274,7 @@ export function deployChart(
           );
         }
       }
-      const {
-        config: { namespace: kubeappsNamespace },
-      } = getState();
-      await App.create(releaseName, namespace, kubeappsNamespace, chartVersion, values);
+      await App.create(releaseName, namespace, chartNamespace, chartVersion, values);
       dispatch(receiveDeployApp());
       return true;
     } catch (e) {
@@ -280,6 +286,7 @@ export function deployChart(
 
 export function upgradeApp(
   chartVersion: IChartVersion,
+  chartNamespace: string,
   releaseName: string,
   namespace: string,
   values?: string,
@@ -288,9 +295,6 @@ export function upgradeApp(
   return async (dispatch, getState) => {
     dispatch(requestUpgradeApp());
     try {
-      const {
-        config: { namespace: kubeappsNamespace },
-      } = getState();
       if (values && schema) {
         const validation = validate(values, schema);
         if (!validation.valid) {
@@ -302,7 +306,7 @@ export function upgradeApp(
           );
         }
       }
-      await App.upgrade(releaseName, namespace, kubeappsNamespace, chartVersion, values);
+      await App.upgrade(releaseName, namespace, chartNamespace, chartVersion, values);
       dispatch(receiveUpgradeApp());
       return true;
     } catch (e) {

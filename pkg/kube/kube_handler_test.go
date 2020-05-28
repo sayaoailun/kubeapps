@@ -17,7 +17,10 @@ limitations under the License.
 package kube
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -27,7 +30,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
@@ -45,6 +48,21 @@ type repoStub struct {
 	private bool
 }
 
+type secretStub struct {
+	name string
+}
+
+type fakeHTTPCli struct {
+	response *http.Response
+	err      error
+}
+
+func (f *fakeHTTPCli) Do(*http.Request) (*http.Response, error) {
+	return f.response, f.err
+}
+
+const kubeappsNamespace = "kubeapps"
+
 func makeAppRepoObjects(reposPerNamespace map[string][]repoStub) []runtime.Object {
 	objects := []runtime.Object{}
 	for namespace, repoStubs := range reposPerNamespace {
@@ -61,6 +79,22 @@ func makeAppRepoObjects(reposPerNamespace map[string][]repoStub) []runtime.Objec
 				appRepo.Spec.Auth.Header = authHeader
 			}
 			objects = append(objects, runtime.Object(appRepo))
+		}
+	}
+	return objects
+}
+
+func makeSecretObjects(secretsPerNamespace map[string][]secretStub) []runtime.Object {
+	objects := []runtime.Object{}
+	for namespace, secretsStubs := range secretsPerNamespace {
+		for _, secretStub := range secretsStubs {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      secretStub.name,
+					Namespace: namespace,
+				},
+			}
+			objects = append(objects, runtime.Object(secret))
 		}
 	}
 	return objects
@@ -115,71 +149,160 @@ func (f fakeCombinedClientset) RestClient() rest.Interface {
 	return f.rc
 }
 
+func checkErr(t *testing.T, err error, expectedError error) {
+	if err == nil && expectedError != nil {
+		t.Errorf("got: nil, want: %+v", expectedError)
+	} else if err != nil {
+		if expectedError == nil {
+			t.Errorf("got: %+v, want: nil", err)
+		} else if got, want := err.Error(), expectedError.Error(); got != want {
+			t.Errorf("got: %q, want: %q", got, want)
+		}
+	}
+}
+
+func checkAppRepo(t *testing.T, requestData string, requestNamespace string, cs fakeCombinedClientset) (appRepositoryRequest, *v1alpha1.AppRepository, *v1alpha1.AppRepository) {
+	var appRepoRequest appRepositoryRequest
+	err := json.NewDecoder(strings.NewReader(requestData)).Decode(&appRepoRequest)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	// Ensure the expected AppRepository is stored
+	expectedAppRepo := appRepositoryForRequest(&appRepoRequest)
+	expectedAppRepo.ObjectMeta.Namespace = requestNamespace
+
+	responseAppRepo, err := cs.KubeappsV1alpha1().AppRepositories(requestNamespace).Get(context.TODO(), expectedAppRepo.ObjectMeta.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected data %v not present: %+v", expectedAppRepo, err)
+	}
+
+	if got, want := responseAppRepo, expectedAppRepo; !cmp.Equal(want, got) {
+		t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
+	}
+	return appRepoRequest, expectedAppRepo, responseAppRepo
+}
+
+func checkSecrets(t *testing.T, requestNamespace string, appRepoRequest appRepositoryRequest, expectedAppRepo *v1alpha1.AppRepository, responseAppRepo *v1alpha1.AppRepository, handler userHandler) {
+	// TODO(#1655)
+	// The fake k8s API does not generate UID's for created object
+	// (among other things). We would need to add reactors to the fake
+	// to do so to test the UID being set on the secret.
+	// https://github.com/kubernetes/client-go/issues/439
+	// responseAppRepo.ObjectMeta.UID = "dead-beef"
+
+	// When appropriate, ensure the expected secret is stored.
+	if appRepoRequest.AppRepository.AuthHeader != "" {
+		expectedSecret := secretForRequest(&appRepoRequest, responseAppRepo)
+		expectedSecret.ObjectMeta.Namespace = requestNamespace
+		responseSecret, err := handler.clientset.CoreV1().Secrets(requestNamespace).Get(context.TODO(), expectedSecret.ObjectMeta.Name, metav1.GetOptions{})
+
+		if err != nil {
+			t.Errorf("expected data %v not present: %+v", expectedSecret, err)
+		}
+
+		if got, want := responseSecret, expectedSecret; !cmp.Equal(want, got) {
+			t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
+		}
+
+		// Verify the copy of the repo secret in in kubeapps is
+		// also stored if this is a per-namespace app repository.
+		kubeappsSecretName := KubeappsSecretNameForRepo(expectedAppRepo.ObjectMeta.Name, expectedAppRepo.ObjectMeta.Namespace)
+		expectedSecret.ObjectMeta.Name = kubeappsSecretName
+		expectedSecret.ObjectMeta.Namespace = kubeappsNamespace
+		// The owner ref cannot be present for the copy in the kubeapps namespace.
+		expectedSecret.ObjectMeta.OwnerReferences = nil
+
+		if requestNamespace != kubeappsNamespace {
+			responseSecret, err = handler.clientset.CoreV1().Secrets(kubeappsNamespace).Get(context.TODO(), kubeappsSecretName, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("expected data %v not present: %+v", expectedSecret, err)
+			}
+
+			if got, want := responseSecret, expectedSecret; !cmp.Equal(want, got) {
+				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
+			}
+		} else {
+			// The copy of the secret should not be created when the request namespace is kubeapps.
+			secret, err := handler.clientset.CoreV1().Secrets(kubeappsNamespace).Get(context.TODO(), kubeappsSecretName, metav1.GetOptions{})
+			if err == nil {
+				t.Fatalf("secret should not be created, found %+v", secret)
+			}
+			if got, want := errorCodeForK8sError(t, err), 404; got != want {
+				t.Errorf("got: %d, want: %d", got, want)
+			}
+		}
+	}
+
+}
+
 func TestAppRepositoryCreate(t *testing.T) {
 	testCases := []struct {
-		name              string
-		requestNamespace  string
-		kubeappsNamespace string
-		existingRepos     map[string][]repoStub
-		requestData       string
-		expectedError     error
+		name             string
+		requestNamespace string
+		existingRepos    map[string][]repoStub
+		requestData      string
+		expectedError    error
 	}{
 		{
-			name:              "it creates an app repository in the default kubeappsNamespace",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
+			name:             "it creates an app repository in the default kubeappsNamespace",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
 		},
 		{
-			name:              "it creates an app repository in a specific namespace",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "my-namespace",
-			requestData:       `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
+			name:             "it creates an app repository in a specific namespace",
+			requestNamespace: "my-namespace",
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
 		},
 		{
-			name:              "it creates an app repository with an empty template",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "syncJobPodTemplate": {}}}`,
+			name:             "it creates an app repository with an empty template",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "syncJobPodTemplate": {}}}`,
 		},
 		{
-			name:              "it errors if the repo exists in the kubeapps ns already",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `{"appRepository": {"name": "bitnami"}}`,
+			name:             "it includes the docker registry secret names when provided",
+			requestNamespace: "other-namespace",
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "registrySecrets": ["secret-one", "secret-two"]}}`,
+		},
+		{
+			name:             "it errors if docker registry secrets are included for a global app repository",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "registrySecrets": ["secret-one", "secret-two"]}}`,
+			expectedError:    ErrGlobalRepositoryWithSecrets,
+		},
+		{
+			name:             "it errors if the repo exists in the kubeapps ns already",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "bitnami"}}`,
 			existingRepos: map[string][]repoStub{
 				"kubeapps": []repoStub{repoStub{name: "bitnami"}},
 			},
 			expectedError: fmt.Errorf(`apprepositories.kubeapps.com "bitnami" already exists`),
 		},
 		{
-			name:              "it creates the repo even if the same repo exists in other namespaces",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `{"appRepository": {"name": "bitnami"}}`,
+			name:             "it creates the repo even if the same repo exists in other namespaces",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "bitnami"}}`,
 			existingRepos: map[string][]repoStub{
 				"kubeapps-other-ns-1": []repoStub{repoStub{name: "bitnami"}},
 				"kubeapps-other-ns-2": []repoStub{repoStub{name: "bitnami"}},
 			},
 		},
 		{
-			name:              "it results in a bad request if the json cannot be parsed",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `not a { json object`,
-			expectedError:     fmt.Errorf(`invalid character 'o' in literal null (expecting 'u')`),
+			name:             "it results in a bad request if the json cannot be parsed",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `not a { json object`,
+			expectedError:    fmt.Errorf(`invalid character 'o' in literal null (expecting 'u')`),
 		},
 		{
-			name:              "it creates a secret if the auth header is set",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "kubeapps",
-			requestData:       `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+			name:             "it creates a secret if the auth header is set",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
 		},
 		{
-			name:              "it creates a copy of the namespaced repo secret in the kubeapps namespace",
-			kubeappsNamespace: "kubeapps",
-			requestNamespace:  "test-namespace",
-			requestData:       `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+			name:             "it creates a copy of the namespaced repo secret in the kubeapps namespace",
+			requestNamespace: "test-namespace",
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
 		},
 	}
 
@@ -191,85 +314,115 @@ func TestAppRepositoryCreate(t *testing.T) {
 				&fakeRest.RESTClient{},
 			}
 			handler := userHandler{
-				kubeappsNamespace: tc.kubeappsNamespace,
+				kubeappsNamespace: kubeappsNamespace,
 				svcClientset:      cs,
 				clientset:         cs,
 			}
 
 			apprepo, err := handler.CreateAppRepository(ioutil.NopCloser(strings.NewReader(tc.requestData)), tc.requestNamespace)
-
-			if err == nil && tc.expectedError != nil {
-				t.Errorf("got: nil, want: %+v", tc.expectedError)
-			} else if err != nil {
-				if tc.expectedError == nil {
-					t.Errorf("got: %+v, want: nil", err)
-				} else if got, want := err.Error(), tc.expectedError.Error(); got != want {
-					t.Errorf("got: %q, want: %q", got, want)
-				}
-			}
+			checkErr(t, err, tc.expectedError)
 
 			if apprepo != nil {
-				var appRepoRequest appRepositoryRequest
-				err := json.NewDecoder(strings.NewReader(tc.requestData)).Decode(&appRepoRequest)
-				if err != nil {
-					t.Fatalf("%+v", err)
-				}
+				appRepoRequest, expectedAppRepo, responseAppRepo := checkAppRepo(t, tc.requestData, tc.requestNamespace, cs)
+				checkSecrets(t, tc.requestNamespace, appRepoRequest, expectedAppRepo, responseAppRepo, handler)
+			}
+		})
+	}
+}
 
-				// Ensure the expected AppRepository is stored
-				expectedAppRepo := appRepositoryForRequest(appRepoRequest)
-				expectedAppRepo.ObjectMeta.Namespace = tc.requestNamespace
+func TestAppRepositoryUpdate(t *testing.T) {
+	const kubeappsNamespace = "kubeapps"
+	testCases := []struct {
+		name             string
+		requestNamespace string
+		existingRepos    map[string][]repoStub
+		existingSecrets  map[string][]secretStub
+		requestData      string
+		expectedError    error
+	}{
+		{
+			name:             "it updates an app repository in the default kubeappsNamespace",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
+			existingRepos: map[string][]repoStub{
+				"kubeapps": []repoStub{repoStub{name: "test-repo"}},
+			},
+		},
+		{
+			name:             "it errors if the repo doesn't exist",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo"}}`,
+			expectedError:    errors.New("apprepositories.kubeapps.com \"test-repo\" not found"),
+		},
+		{
+			name:             "it updates an app repository in the correct namespace",
+			requestNamespace: "default",
+			requestData:      `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo"}}`,
+			existingRepos: map[string][]repoStub{
+				"default": []repoStub{repoStub{name: "test-repo"}},
+			},
+		},
+		{
+			name:             "it creates a secret if the auth header is set",
+			requestNamespace: kubeappsNamespace,
+			existingRepos: map[string][]repoStub{
+				"kubeapps": []repoStub{repoStub{name: "test-repo"}},
+			},
+			requestData: `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+		},
+		{
+			name:             "it creates a secret if the auth header is set in different namespaces",
+			requestNamespace: "default",
+			existingRepos: map[string][]repoStub{
+				"kubeapps": []repoStub{repoStub{name: "test-repo"}},
+				"default":  []repoStub{repoStub{name: "test-repo"}},
+			},
+			requestData: `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+		},
+		{
+			name:             "it updates a secret if the auth header is set",
+			requestNamespace: kubeappsNamespace,
+			existingRepos: map[string][]repoStub{
+				"kubeapps": []repoStub{repoStub{name: "test-repo"}},
+			},
+			existingSecrets: map[string][]secretStub{
+				"kubeapps": []secretStub{secretStub{name: "apprepo-test-repo"}},
+			},
+			requestData: `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+		},
+		{
+			name:             "it updates a secret if the auth header is set in both default and kubeapps namespace",
+			requestNamespace: "default",
+			existingRepos: map[string][]repoStub{
+				"default": []repoStub{repoStub{name: "test-repo"}},
+			},
+			existingSecrets: map[string][]secretStub{
+				"kubeapps": []secretStub{secretStub{name: "default-apprepo-test-repo"}},
+				"default":  []secretStub{secretStub{name: "apprepo-test-repo"}},
+			},
+			requestData: `{"appRepository": {"name": "test-repo", "url": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+		},
+	}
 
-				responseAppRepo, err := cs.KubeappsV1alpha1().AppRepositories(tc.requestNamespace).Get(expectedAppRepo.ObjectMeta.Name, metav1.GetOptions{})
-				if err != nil {
-					t.Fatalf("expected data %v not present: %+v", expectedAppRepo, err)
-				}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fakeCombinedClientset{
+				fakeapprepoclientset.NewSimpleClientset(makeAppRepoObjects(tc.existingRepos)...),
+				fakecoreclientset.NewSimpleClientset(),
+				&fakeRest.RESTClient{},
+			}
+			handler := userHandler{
+				kubeappsNamespace: kubeappsNamespace,
+				svcClientset:      cs,
+				clientset:         cs,
+			}
 
-				if got, want := responseAppRepo, expectedAppRepo; !cmp.Equal(want, got) {
-					t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
-				}
+			apprepo, err := handler.UpdateAppRepository(ioutil.NopCloser(strings.NewReader(tc.requestData)), tc.requestNamespace)
+			checkErr(t, err, tc.expectedError)
 
-				// When appropriate, ensure the expected secret is stored.
-				if appRepoRequest.AppRepository.AuthHeader != "" {
-					expectedSecret := secretForRequest(appRepoRequest, responseAppRepo)
-					expectedSecret.ObjectMeta.Namespace = tc.requestNamespace
-					responseSecret, err := cs.CoreV1().Secrets(tc.requestNamespace).Get(expectedSecret.ObjectMeta.Name, metav1.GetOptions{})
-
-					if err != nil {
-						t.Errorf("expected data %v not present: %+v", expectedSecret, err)
-					}
-
-					if got, want := responseSecret, expectedSecret; !cmp.Equal(want, got) {
-						t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
-					}
-
-					// Verify the copy of the repo secret in in kubeapps is
-					// also stored if this is a per-namespace app repository.
-					kubeappsSecretName := KubeappsSecretNameForRepo(expectedAppRepo.ObjectMeta.Name, expectedAppRepo.ObjectMeta.Namespace)
-					expectedSecret.ObjectMeta.Name = kubeappsSecretName
-					expectedSecret.ObjectMeta.Namespace = tc.kubeappsNamespace
-					// The owner ref cannot be present for the copy in the kubeapps namespace.
-					expectedSecret.ObjectMeta.OwnerReferences = nil
-
-					if tc.requestNamespace != tc.kubeappsNamespace {
-						responseSecret, err = handler.clientset.CoreV1().Secrets(tc.kubeappsNamespace).Get(kubeappsSecretName, metav1.GetOptions{})
-						if err != nil {
-							t.Errorf("expected data %v not present: %+v", expectedSecret, err)
-						}
-
-						if got, want := responseSecret, expectedSecret; !cmp.Equal(want, got) {
-							t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
-						}
-					} else {
-						// The copy of the secret should not be created when the request namespace is kubeapps.
-						secret, err := handler.clientset.CoreV1().Secrets(tc.kubeappsNamespace).Get(kubeappsSecretName, metav1.GetOptions{})
-						if err == nil {
-							t.Fatalf("secret should not be created, found %+v", secret)
-						}
-						if got, want := errorCodeForK8sError(t, err), 404; got != want {
-							t.Errorf("got: %d, want: %d", got, want)
-						}
-					}
-				}
+			if apprepo != nil {
+				appRepoRequest, expectedAppRepo, responseAppRepo := checkAppRepo(t, tc.requestData, tc.requestNamespace, cs)
+				checkSecrets(t, tc.requestNamespace, appRepoRequest, expectedAppRepo, responseAppRepo, handler)
 			}
 		})
 	}
@@ -332,7 +485,7 @@ func TestDeleteAppRepository(t *testing.T) {
 
 			if err == nil {
 				// Ensure the repo has been deleted, so expecting a 404.
-				_, err = cs.KubeappsV1alpha1().AppRepositories(tc.requestNamespace).Get(tc.repoName, metav1.GetOptions{})
+				_, err = cs.KubeappsV1alpha1().AppRepositories(tc.requestNamespace).Get(context.TODO(), tc.repoName, metav1.GetOptions{})
 				if got, want := errorCodeForK8sError(t, err), 404; got != want {
 					t.Errorf("got: %d, want: %d", got, want)
 				}
@@ -341,7 +494,7 @@ func TestDeleteAppRepository(t *testing.T) {
 				// because the fake client does not handle finalizers but verified in real life.
 
 				// Ensure any copy of the repo credentials has been deleted from the kubeapps namespace.
-				_, err = cs.CoreV1().Secrets(kubeappsNamespace).Get(KubeappsSecretNameForRepo(tc.repoName, tc.requestNamespace), metav1.GetOptions{})
+				_, err = cs.CoreV1().Secrets(kubeappsNamespace).Get(context.TODO(), KubeappsSecretNameForRepo(tc.repoName, tc.requestNamespace), metav1.GetOptions{})
 				if got, want := errorCodeForK8sError(t, err), 404; got != want {
 					t.Errorf("got: %d, want: %d", got, want)
 				}
@@ -354,7 +507,7 @@ func errorCodeForK8sError(t *testing.T, err error) int {
 	if err == nil {
 		return 0
 	}
-	if statusErr, ok := err.(*errors.StatusError); ok {
+	if statusErr, ok := err.(*k8sErrors.StatusError); ok {
 		return int(statusErr.ErrStatus.Code)
 	}
 	t.Fatalf("unable to convert error to status error")
@@ -504,7 +657,7 @@ func TestAppRepositoryForRequest(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, want := appRepositoryForRequest(appRepositoryRequest{tc.request}), &tc.appRepo; !cmp.Equal(want, got) {
+			if got, want := appRepositoryForRequest(&appRepositoryRequest{tc.request}), &tc.appRepo; !cmp.Equal(want, got) {
 				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
 			}
 		})
@@ -587,7 +740,7 @@ func TestSecretForRequest(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, want := secretForRequest(appRepositoryRequest{tc.request}, &appRepo), tc.secret; !cmp.Equal(want, got) {
+			if got, want := secretForRequest(&appRepositoryRequest{tc.request}, &appRepo), tc.secret; !cmp.Equal(want, got) {
 				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
 			}
 		})
@@ -629,11 +782,11 @@ func TestGetNamespaces(t *testing.T) {
 			}
 
 			for _, ns := range tc.existingNS {
-				cs.Clientset.CoreV1().Namespaces().Create(&corev1.Namespace{
+				cs.Clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: ns,
 					},
-				})
+				}, metav1.CreateOptions{})
 			}
 
 			cs.Clientset.Fake.PrependReactor(
@@ -670,39 +823,90 @@ func TestGetNamespaces(t *testing.T) {
 
 func TestValidateAppRepository(t *testing.T) {
 	const kubeappsNamespace = "kubeapps"
-	testCases := []struct {
-		name            string
-		repoName        string
-		requestData     string
-		expectedURL     string
-		expectedHeaders http.Header
+	getValidationCliAndReqTests := []struct {
+		name             string
+		requestData      string
+		requestNamespace string
+		expectedURL      string
+		expectedHeaders  http.Header
+		expectedError    error
 	}{
 		{
-			name:        "it parses the repo URL",
-			repoName:    "my-repo",
-			requestData: `{"appRepository": {"name": "test-repo", "repoURL": "http://example.com/test-repo"}}`,
-			expectedURL: "http://example.com/test-repo/index.yaml",
+			name:             "it parses the repo URL",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "repoURL": "http://example.com/test-repo"}}`,
+			expectedURL:      "http://example.com/test-repo/index.yaml",
 		},
 		{
-			name:            "it includes the auth creds",
-			repoName:        "my-repo",
-			requestData:     `{"appRepository": {"name": "test-repo", "repoURL": "http://example.com/test-repo", "authHeader": "test-me"}}`,
-			expectedURL:     "http://example.com/test-repo/index.yaml",
-			expectedHeaders: http.Header{"Authorization": []string{"test-me"}},
+			name:             "it includes the auth creds",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "repoURL": "http://example.com/test-repo", "authHeader": "test-me"}}`,
+			expectedURL:      "http://example.com/test-repo/index.yaml",
+			expectedHeaders:  http.Header{"Authorization": []string{"test-me"}},
+		},
+		{
+			name:             "validation fails if docker registry secrets included for a global repo",
+			requestNamespace: kubeappsNamespace,
+			requestData:      `{"appRepository": {"name": "test-repo", "repoURL": "http://example.com/test-repo", "registrySecrets": ["secret-1"]}}`,
+			expectedError:    ErrGlobalRepositoryWithSecrets,
 		},
 	}
 
-	for _, tc := range testCases {
+	for _, tc := range getValidationCliAndReqTests {
 		t.Run(tc.name, func(t *testing.T) {
-			cli, req, err := getValidationCliAndReq(ioutil.NopCloser(strings.NewReader(tc.requestData)))
-			if err != nil {
-				t.Error(err)
+			cli, req, err := getValidationCliAndReq(ioutil.NopCloser(strings.NewReader(tc.requestData)), tc.requestNamespace, kubeappsNamespace)
+			if (err != nil || tc.expectedError != nil) && !errors.Is(err, tc.expectedError) {
+				t.Fatalf("got: %+v, want: %+v", err, tc.expectedError)
+			}
+			if tc.expectedError != nil {
+				return
 			}
 			if tc.expectedURL != req.URL.String() {
 				t.Errorf("Expected %v got %v", tc.expectedURL, req.URL.String())
 			}
 			if tc.expectedHeaders != nil && !cmp.Equal(tc.expectedHeaders, cli.(*clientWithDefaultHeaders).defaultHeaders) {
 				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(tc.expectedHeaders, cli.(*clientWithDefaultHeaders).defaultHeaders))
+			}
+		})
+	}
+
+	doValidationRequestTests := []struct {
+		name           string
+		err            error
+		response       *http.Response
+		expectedResult *ValidationResponse
+	}{
+		{
+			name:           "returns nil if there is no error and the response is okay",
+			err:            nil,
+			response:       &http.Response{StatusCode: 200, Body: ioutil.NopCloser(bytes.NewReader([]byte("OK")))},
+			expectedResult: &ValidationResponse{Code: 200, Message: "OK"},
+		},
+		{
+			name:           "returns an error",
+			err:            fmt.Errorf("Boom"),
+			response:       &http.Response{},
+			expectedResult: &ValidationResponse{Code: 400, Message: "Boom"},
+		},
+		{
+			name:           "returns an error from the response",
+			err:            nil,
+			response:       &http.Response{StatusCode: 401, Body: ioutil.NopCloser(bytes.NewReader([]byte("Boom")))},
+			expectedResult: &ValidationResponse{Code: 401, Message: "Boom"},
+		},
+	}
+	for _, tc := range doValidationRequestTests {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := &fakeHTTPCli{
+				response: tc.response,
+				err:      tc.err,
+			}
+			got, err := doValidationRequest(cli, &http.Request{})
+			if err != nil {
+				t.Errorf("Unexpected error %v", err)
+			}
+			if want := tc.expectedResult; !cmp.Equal(want, got) {
+				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
 			}
 		})
 	}

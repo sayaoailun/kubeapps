@@ -13,10 +13,17 @@ const defaultProps = {
   resyncRepo: jest.fn(),
   resyncAllRepos: jest.fn(),
   install: jest.fn(),
+  update: jest.fn(),
   validate: jest.fn(),
   namespace: defaultNamespace,
+  kubeappsNamespace: "kubeapps",
   displayReposPerNamespaceMsg: false,
+  validating: false,
   isFetching: false,
+  repoSecrets: [],
+  fetchImagePullSecrets: jest.fn(),
+  imagePullSecrets: [],
+  createDockerRegistrySecret: jest.fn(),
 };
 
 describe("AppRepoList", () => {
@@ -93,5 +100,23 @@ describe("AppRepoList", () => {
     expect(loading).toHaveProp({
       loaded: false,
     });
+  });
+
+  it("displays the AppRepoAddButton when no fetching errors", () => {
+    const wrapper = shallow(<AppRepoList {...defaultProps} />);
+
+    const addButton = wrapper.find("AppRepoAddButton");
+    expect(addButton.length).toBe(1);
+  });
+
+  it("does not display the AppRepoAddButton when there is a fetching error", () => {
+    const props = {
+      ...defaultProps,
+      errors: { fetch: new Error("Bang!") },
+    };
+    const wrapper = shallow(<AppRepoList {...props} />);
+
+    const addButton = wrapper.find("AppRepoAddButton");
+    expect(addButton.length).toBe(0);
   });
 });

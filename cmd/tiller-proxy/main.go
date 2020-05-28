@@ -47,12 +47,11 @@ import (
 )
 
 var (
-	settings             environment.EnvSettings
-	proxy                *tillerProxy.Proxy
-	kubeClient           kubernetes.Interface
-	disableUserAuthCheck bool
-	listLimit            int
-	timeout              int64
+	settings   environment.EnvSettings
+	proxy      *tillerProxy.Proxy
+	kubeClient kubernetes.Interface
+	listLimit  int
+	timeout    int64
 
 	tlsCaCertFile string // path to TLS CA certificate file
 	tlsCertFile   string // path to TLS certificate file
@@ -75,7 +74,6 @@ func init() {
 	pflag.StringVar(&tlsKeyFile, "tls-key", tlsKeyDefault, "path to TLS key file")
 	pflag.BoolVar(&tlsVerify, "tls-verify", false, "enable TLS for request and verify remote")
 	pflag.BoolVar(&tlsEnable, "tls", false, "enable TLS for request")
-	pflag.BoolVar(&disableUserAuthCheck, "disable-auth", false, "Disable authorization check")
 	pflag.IntVar(&listLimit, "list-max", 256, "maximum number of releases to fetch")
 	pflag.StringVar(&userAgentComment, "user-agent-comment", "", "UserAgent comment used during outbound requests")
 	// Default timeout from https://github.com/helm/helm/blob/b0b0accdfc84e154b3d48ec334cd5b4f9b345667/cmd/helm/install.go#L216
@@ -149,42 +147,22 @@ func main() {
 	r.Handle("/live", health)
 	r.Handle("/ready", health)
 
-	authGate := auth.AuthGate()
-
 	// HTTP Handler
 	h := handler.TillerProxy{
-		DisableUserAuthCheck: disableUserAuthCheck,
-		ListLimit:            listLimit,
-		ChartClient:          chartClient,
-		ProxyClient:          proxy,
+		CheckerForRequest: auth.AuthCheckerForRequest,
+		ListLimit:         listLimit,
+		ChartClient:       chartClient,
+		ProxyClient:       proxy,
 	}
 
 	// Routes
 	apiv1 := r.PathPrefix("/v1").Subrouter()
-	apiv1.Methods("GET").Path("/releases").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithoutParams(h.ListAllReleases)),
-	))
-	apiv1.Methods("GET").Path("/namespaces/{namespace}/releases").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithParams(h.ListReleases)),
-	))
-	apiv1.Methods("POST").Path("/namespaces/{namespace}/releases").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithParams(h.CreateRelease)),
-	))
-	apiv1.Methods("GET").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithParams(h.GetRelease)),
-	))
-	apiv1.Methods("PUT").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithParams(h.OperateRelease)),
-	))
-	apiv1.Methods("DELETE").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(negroni.New(
-		authGate,
-		negroni.Wrap(handlerutil.WithParams(h.DeleteRelease)),
-	))
+	apiv1.Methods("GET").Path("/releases").Handler(handlerutil.WithoutParams(h.ListAllReleases))
+	apiv1.Methods("GET").Path("/namespaces/{namespace}/releases").Handler(handlerutil.WithParams(h.ListReleases))
+	apiv1.Methods("POST").Path("/namespaces/{namespace}/releases").Handler(handlerutil.WithParams(h.CreateRelease))
+	apiv1.Methods("GET").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(handlerutil.WithParams(h.GetRelease))
+	apiv1.Methods("PUT").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(handlerutil.WithParams(h.OperateRelease))
+	apiv1.Methods("DELETE").Path("/namespaces/{namespace}/releases/{releaseName}").Handler(handlerutil.WithParams(h.DeleteRelease))
 
 	// Backend routes unrelated to tiller-proxy functionality.
 	err = backendHandlers.SetupDefaultRoutes(r.PathPrefix("/backend/v1").Subrouter())
@@ -193,6 +171,9 @@ func main() {
 	}
 
 	// assetsvc reverse proxy
+	// TODO(mnelson) remove this reverse proxy once the haproxy frontend
+	// proxies requests directly to the assetsvc. Move the authz to the
+	// assetsvc itself.
 	parsedAssetsvcURL, err := url.Parse(assetsvcURL)
 	if err != nil {
 		log.Fatalf("Unable to parse the assetsvc URL: %v", err)
@@ -201,10 +182,9 @@ func main() {
 	assetsvcPrefix := "/assetsvc"
 	assetsvcRouter := r.PathPrefix(assetsvcPrefix).Subrouter()
 	// Logos don't require authentication so bypass that step
-	assetsvcRouter.Methods("GET").Path("/v1/assets/{repo}/{id}/logo").Handler(negroni.New(
-		negroni.Wrap(http.StripPrefix(assetsvcPrefix, assetsvcProxy)),
-	))
-	assetsvcRouter.Methods("GET").Handler(negroni.New(
+	assetsvcRouter.Methods("GET").Path("/v1/ns/{ns}/assets/{repo}/{id}/logo").Handler(http.StripPrefix(assetsvcPrefix, assetsvcProxy))
+	authGate := auth.AuthGate(kubeappsNamespace)
+	assetsvcRouter.PathPrefix("/v1/ns/{namespace}/").Handler(negroni.New(
 		authGate,
 		negroni.Wrap(http.StripPrefix(assetsvcPrefix, assetsvcProxy)),
 	))

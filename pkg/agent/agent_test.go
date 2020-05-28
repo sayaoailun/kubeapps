@@ -112,6 +112,8 @@ func TestGetRelease(t *testing.T) {
 		t.Run(tc.description, func(t *testing.T) {
 			cfg := newActionConfigFixture(t)
 			makeReleases(t, cfg, tc.existingReleases)
+			cfg.Releases.Driver.(*driver.Memory).SetNamespace(tc.targetNamespace)
+
 			rls, err := GetRelease(cfg, tc.targetApp)
 			if tc.shouldFail && err == nil {
 				t.Errorf("Get %s/%s should fail", tc.targetNamespace, tc.targetApp)
@@ -191,7 +193,7 @@ func TestCreateReleases(t *testing.T) {
 				ChartName: tc.chartName,
 			}, nil, false)
 			// Perform test
-			rls, err := CreateRelease(actionConfig, tc.chartName, tc.namespace, tc.values, ch.Helm3Chart)
+			rls, err := CreateRelease(actionConfig, tc.chartName, tc.namespace, tc.values, ch.Helm3Chart, nil)
 			// Check result
 			if tc.shouldFail && err == nil {
 				t.Errorf("Should fail with %v; instead got %s in %s", tc.desc, tc.releaseName, tc.namespace)
@@ -427,6 +429,7 @@ func TestListReleases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			actionConfig := newActionConfigFixture(t)
 			makeReleases(t, actionConfig, tc.releases)
+			actionConfig.Releases.Driver.(*driver.Memory).SetNamespace(tc.namespace)
 
 			apps, err := ListReleases(actionConfig, tc.namespace, tc.listLimit, tc.status)
 			if err != nil {
@@ -678,7 +681,7 @@ func TestUpgradeRelease(t *testing.T) {
 			ch, _ := fakechart.GetChart(&kubechart.Details{
 				ChartName: tc.chartName,
 			}, nil, false)
-			newRelease, err := UpgradeRelease(cfg, tc.release, tc.valuesYaml, ch.Helm3Chart)
+			newRelease, err := UpgradeRelease(cfg, tc.release, tc.valuesYaml, ch.Helm3Chart, nil)
 			// Check for errors
 			if got, want := err != nil, tc.shouldFail; got != want {
 				t.Errorf("Failure: got: %v, want: %v", got, want)

@@ -1,7 +1,7 @@
 import { RouterAction } from "connected-react-router";
-import * as yaml from "js-yaml";
 import { assignWith, isEqual } from "lodash";
 import * as React from "react";
+import * as yaml from "yaml";
 
 import AccessURLTable from "../../containers/AccessURLTableContainer";
 import ApplicationStatus from "../../containers/ApplicationStatusContainer";
@@ -23,7 +23,7 @@ export interface IAppViewProps {
   // TODO(miguel) how to make optional props? I tried adding error? but the container complains
   error: Error | undefined;
   deleteError: Error | undefined;
-  getAppWithUpdateInfo: (releaseName: string, namespace: string) => void;
+  getAppWithUpdateInfo: (namespace: string, releaseName: string) => void;
   deleteApp: (releaseName: string, namespace: string, purge: boolean) => Promise<boolean>;
   push: (location: string) => RouterAction;
 }
@@ -39,7 +39,7 @@ interface IAppViewState {
   manifest: IResource[];
 }
 
-interface IPartialAppViewState {
+export interface IPartialAppViewState {
   deployRefs: ResourceRef[];
   statefulSetRefs: ResourceRef[];
   daemonSetRefs: ResourceRef[];
@@ -78,24 +78,22 @@ class AppView extends React.Component<IAppViewProps, IAppViewState> {
 
   public async componentDidMount() {
     const { releaseName, getAppWithUpdateInfo, namespace } = this.props;
-    getAppWithUpdateInfo(releaseName, namespace);
+    getAppWithUpdateInfo(namespace, releaseName);
   }
 
   public componentDidUpdate(prevProps: IAppViewProps) {
     const { releaseName, getAppWithUpdateInfo, namespace, error, app } = this.props;
     if (prevProps.namespace !== namespace) {
-      getAppWithUpdateInfo(releaseName, namespace);
+      getAppWithUpdateInfo(namespace, releaseName);
       return;
     }
     if (error || !app) {
       return;
     }
 
-    // TODO(prydonius): Okay to use non-safe load here since we assume the
-    // manifest is pre-parsed by Helm and Kubernetes. Look into switching back
-    // to safeLoadAll once https://github.com/nodeca/js-yaml/issues/456 is
-    // resolved.
-    let manifest: IResource[] = yaml.loadAll(app.manifest, undefined, { json: true });
+    let manifest: IResource[] = yaml
+      .parseAllDocuments(app.manifest)
+      .map((doc: yaml.ast.Document) => doc.toJSON());
     // Filter out elements in the manifest that does not comply
     // with { kind: foo }
     manifest = manifest.filter(r => r && r.kind);

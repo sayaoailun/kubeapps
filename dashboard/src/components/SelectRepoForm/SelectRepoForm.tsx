@@ -8,14 +8,15 @@ import { ErrorSelector, MessageAlert } from "../ErrorAlert";
 
 interface ISelectRepoFormProps {
   isFetching: boolean;
+  namespace: string;
   kubeappsNamespace: string;
   repoError?: Error;
   error?: Error;
   repo: IAppRepository;
   repos: IAppRepository[];
   chartName: string;
-  checkChart: (repo: string, chartName: string) => any;
-  fetchRepositories: () => void;
+  checkChart: (namespace: string, repo: string, chartName: string) => any;
+  fetchRepositories: (namespace: string) => void;
 }
 
 interface ISelectRepoFormState {
@@ -31,7 +32,7 @@ class SelectRepoForm extends React.Component<ISelectRepoFormProps, ISelectRepoFo
   };
 
   public componentDidMount() {
-    this.props.fetchRepositories();
+    this.props.fetchRepositories(this.props.namespace);
   }
 
   public render() {
@@ -57,7 +58,10 @@ class SelectRepoForm extends React.Component<ISelectRepoFormProps, ISelectRepoFo
             <div>
               <h5>Chart repositories not found.</h5>
               Manage your Helm chart repositories in Kubeapps by visiting the{" "}
-              <Link to={"/config/repos"}>App repositories configuration</Link> page.
+              <Link to={`/config/ns/${this.props.namespace}/repos`}>
+                App repositories configuration
+              </Link>{" "}
+              page.
             </div>
           }
         />
@@ -106,7 +110,7 @@ class SelectRepoForm extends React.Component<ISelectRepoFormProps, ISelectRepoFo
   }
 
   public handleChartRepoNameChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
-    this.props.checkChart(e.currentTarget.value, this.props.chartName);
+    this.props.checkChart(this.props.namespace, e.currentTarget.value, this.props.chartName);
     this.setState({ repo: e.currentTarget.value });
   };
 

@@ -15,7 +15,6 @@
 # limitations under the License.
 
 set -o errexit
-set -o nounset
 set -o pipefail
 
 # Constants
@@ -77,6 +76,105 @@ tiller-init-rbac() {
     retry_while "helm version ${HELM_CLIENT_TLS_FLAGS[*]} --tiller-connection-timeout 1" "60" "1"
 }
 
+########################
+# Check if the pod that populates de OperatorHub catalog is running
+# Globals: None
+# Arguments: None
+# Returns: None
+#########################
+isOperatorHubCatalogRunning() {
+  kubectl get pod -n olm -l olm.catalogSource=operatorhubio-catalog -o jsonpath='{.items[0].status.phase}' | grep Running
+  # Wait also for the catalog to be populated
+  kubectl get packagemanifests.packages.operators.coreos.com | grep prometheus
+}
+
+########################
+# Install OLM
+# Globals: None
+# Arguments:
+#   $1: Version of OLM
+# Returns: None
+#########################
+installOLM() {
+    local release=$1
+    info "Installing OLM ${release} ..."
+    url=https://github.com/operator-framework/operator-lifecycle-manager/releases/download/${release}
+    namespace=olm
+
+    kubectl apply -f ${url}/crds.yaml
+
+    # The Pod that populates the catalog gets OOM Killed due to very low limits
+    # This has been fixed here: https://github.com/operator-framework/operator-lifecycle-manager/pull/1389
+    # But the fix has not been published yet. To workaround the issue we are using a newer image
+    # This will be fixed in a version > 0.14.2
+    kubectl apply -f "${ROOT_DIR}/script/manifests/olm.yaml"
+
+    # wait for deployments to be ready
+    kubectl rollout status -w deployment/olm-operator --namespace="${namespace}"
+    kubectl rollout status -w deployment/catalog-operator --namespace="${namespace}"
+}
+
+########################
+# Install chartmuseum
+# Globals: None
+# Arguments:
+#   $1: Username
+#   $2: Password
+# Returns: None
+#########################
+installChartmuseum() {
+    local user=$1
+    local password=$2
+    info "Installing ChartMuseum ..."
+    helm repo add stable https://kubernetes-charts.storage.googleapis.com
+    helm repo up
+    if [[ "${HELM_VERSION:-}" =~ "v2" ]]; then
+      helm install --name chartmuseum --namespace kubeapps stable/chartmuseum \
+        "${HELM_CLIENT_TLS_FLAGS[@]}" \
+        --set env.open.DISABLE_API=false \
+        --set persistence.enabled=true \
+        --set secret.AUTH_USER=$user \
+        --set secret.AUTH_PASS=$password
+    else
+      helm install chartmuseum --namespace kubeapps stable/chartmuseum \
+        --set env.open.DISABLE_API=false \
+        --set persistence.enabled=true \
+        --set secret.AUTH_USER=$user \
+        --set secret.AUTH_PASS=$password
+    fi
+    kubectl rollout status -w deployment/chartmuseum-chartmuseum --namespace=kubeapps
+}
+
+########################
+# Push a chart to chartmusem
+# Globals: None
+# Arguments:
+#   $1: chart
+#   $2: version
+#   $3: chartmuseum username
+#   $4: chartmuseum password
+# Returns: None
+#########################
+pushChart() {
+    local chart=$1
+    local version=$2
+    local user=$3
+    local password=$4
+    info "Adding ${chart}-${version} to ChartMuseum ..."
+    curl -LO "https://charts.bitnami.com/bitnami/${chart}-${version}.tgz"
+
+    local POD_NAME=$(kubectl get pods --namespace kubeapps -l "app=chartmuseum" -l "release=chartmuseum" -o jsonpath="{.items[0].metadata.name}")
+    /bin/sh -c "kubectl port-forward $POD_NAME 8080:8080 --namespace kubeapps &"
+    sleep 2
+    curl -u "${user}:${password}" --data-binary "@${chart}-${version}.tgz" http://localhost:8080/api/charts
+    pkill -f "kubectl port-forward $POD_NAME 8080:8080 --namespace kubeapps"
+}
+
+# Operators are not supported in GKE 1.14 and flaky in 1.15
+if [[ -z "${GKE_BRANCH-}" ]]; then
+  installOLM 0.14.1
+fi
+
 info "IMAGE TAG TO BE TESTED: $DEV_TAG"
 info "IMAGE_REPO_SUFFIX: $IMG_MODIFIER"
 info "Cluster Version: $(kubectl version -o json | jq -r '.serverVersion.gitVersion')"
@@ -113,17 +211,25 @@ img_flags=(
   "--set" "kubeops.image.repository=${images[5]}"
 )
 
+# TODO(andresmgot): Remove this condition with the parameter in the next version
+invalidateCacheFlag=""
+if [[ -z "${TEST_LATEST_RELEASE:-}" ]]; then
+  invalidateCacheFlag="--set featureFlags.invalidateCache=true"
+fi
+
 if [[ "${HELM_VERSION:-}" =~ "v2" ]]; then
   # Init Tiller
   tiller-init-rbac
   # Install Kubeapps
   info "Installing Kubeapps..."
+  helm repo add bitnami https://charts.bitnami.com/bitnami
   helm dep up "${ROOT_DIR}/chart/kubeapps/"
   helm install --name kubeapps-ci --namespace kubeapps "${ROOT_DIR}/chart/kubeapps" \
     "${HELM_CLIENT_TLS_FLAGS[@]}" \
     --set tillerProxy.tls.key="$(cat "${CERTS_DIR}/helm.key.pem")" \
     --set tillerProxy.tls.cert="$(cat "${CERTS_DIR}/helm.cert.pem")" \
-    --set featureFlags.invalidateCache=true \
+    --set featureFlags.operators=true \
+    ${invalidateCacheFlag} \
     "${img_flags[@]}" \
     "${db_flags[@]}"
 else
@@ -132,11 +238,15 @@ else
   kubectl create ns kubeapps
   helm dep up "${ROOT_DIR}/chart/kubeapps/"
   helm install kubeapps-ci --namespace kubeapps "${ROOT_DIR}/chart/kubeapps" \
-    --set featureFlags.invalidateCache=true \
+    ${invalidateCacheFlag} \
     "${img_flags[@]}" \
     "${db_flags[@]}" \
+    --set featureFlags.operators=true \
     --set useHelm3=true
 fi
+
+installChartmuseum admin password
+pushChart apache 7.3.15 admin password
 
 # Ensure that we are testing the correct image
 info ""
@@ -185,25 +295,37 @@ for svc in "${svcs[@]}"; do
   info "Endpoints for ${svc} available"
 done
 
-# Run helm tests
-# Retry once if tests fail to avoid temporary issue
-if ! retry_while testHelm "2" "1"; then
-  warn "PODS status on failure"
-  kubectl get pods -n kubeapps
-  for pod in $(kubectl get po -l release=kubeapps-ci -oname -n kubeapps); do
-    warn "LOGS for pod $pod ------------"
-    kubectl logs -n kubeapps "$pod"
-  done;
-  echo
-  warn "LOGS for assetsvc tests --------"
-  kubectl logs kubeapps-ci-assetsvc-test --namespace kubeapps
-  warn "LOGS for tiller-proxy tests --------"
-  kubectl logs kubeapps-ci-tiller-proxy-test --namespace kubeapps
-  warn "LOGS for dashboard tests --------"
-  kubectl logs kubeapps-ci-dashboard-test --namespace kubeapps
-  exit 1
+# Disable helm tests unless we are testing the latest release until
+# we have released the code with per-namespace tests (since the helm
+# tests for assetsvc needs to test the namespaced repo).
+if [[ -z "${TEST_LATEST_RELEASE:-}" ]]; then
+  # Run helm tests
+  # Retry once if tests fail to avoid temporary issue
+  if ! retry_while testHelm "2" "1"; then
+    warn "PODS status on failure"
+    kubectl get pods -n kubeapps
+    for pod in $(kubectl get po -l release=kubeapps-ci -oname -n kubeapps); do
+      warn "LOGS for pod $pod ------------"
+      kubectl logs -n kubeapps "$pod"
+    done;
+    echo
+    warn "LOGS for assetsvc tests --------"
+    kubectl logs kubeapps-ci-assetsvc-test --namespace kubeapps
+    warn "LOGS for tiller-proxy tests --------"
+    kubectl logs kubeapps-ci-tiller-proxy-test --namespace kubeapps
+    warn "LOGS for dashboard tests --------"
+    kubectl logs kubeapps-ci-dashboard-test --namespace kubeapps
+    exit 1
+  fi
+  info "Helm tests succeded!!"
 fi
-info "Helm tests succeded!!"
+
+# Operators are not supported in GKE 1.14 and flaky in 1.15
+if [[ -z "${GKE_BRANCH-}" ]]; then
+  ## Wait for the Operator catalog to be populated
+  info "Waiting for the OperatorHub Catalog to be ready ..."
+  retry_while isOperatorHubCatalogRunning 24
+fi
 
 # Browser tests
 cd "${ROOT_DIR}/integration"
@@ -214,11 +336,27 @@ pod=$(kubectl get po -l run=integration -o jsonpath="{.items[0].metadata.name}")
 for f in *.js; do
   kubectl cp "./${f}" "${pod}:/app/"
 done
+testsToIgnore=()
+# Operators are not supported in GKE 1.14 and flaky in 1.15, skipping test
+if [[ -n "${GKE_BRANCH-}" ]]; then
+  testsToIgnore=("operator-deployment.js" "${testsToIgnore[@]}")
+fi
+## Support for Docker registry secrets are not supported for Helm2, skipping that test
+if [[ "${HELM_VERSION:-}" =~ "v2" ]]; then
+  testsToIgnore=("create-private-registry.js" "${testsToIgnore[@]}")
+fi
+ignoreFlag=""
+if [[ "${#testsToIgnore[@]}" > "0" ]]; then
+  # Join tests to ignore
+  testsToIgnore=$(printf "|%s" "${testsToIgnore[@]}")
+  testsToIgnore=${testsToIgnore:1}
+  ignoreFlag="--testPathIgnorePatterns '$testsToIgnore'"
+fi
 kubectl cp ./use-cases "${pod}:/app/"
 ## Create admin user
 kubectl create serviceaccount kubeapps-operator -n kubeapps
 kubectl create clusterrolebinding kubeapps-operator-admin --clusterrole=admin --serviceaccount kubeapps:kubeapps-operator
-kubectl create -n kubeapps rolebinding kubeapps-repositories-write --role=kubeapps-ci-repositories-write --serviceaccount kubeapps:kubeapps-operator
+kubectl create clusterrolebinding kubeapps-repositories-write --clusterrole kubeapps:kubeapps:apprepositories-write --serviceaccount kubeapps:kubeapps-operator
 ## Create view user
 kubectl create serviceaccount kubeapps-view -n kubeapps
 kubectl create clusterrolebinding kubeapps-view --clusterrole=view --serviceaccount kubeapps:kubeapps-view
@@ -236,7 +374,7 @@ view_token="$(kubectl get -n kubeapps secret "$(kubectl get -n kubeapps servicea
 edit_token="$(kubectl get -n kubeapps secret "$(kubectl get -n kubeapps serviceaccount kubeapps-edit -o jsonpath='{.secrets[].name}')" -o go-template='{{.data.token | base64decode}}' && echo)"
 ## Run tests
 info "Running Integration tests..."
-if ! kubectl exec -it "$pod" -- /bin/sh -c "INTEGRATION_ENTRYPOINT=http://kubeapps-ci.kubeapps ADMIN_TOKEN=${admin_token} VIEW_TOKEN=${view_token} EDIT_TOKEN=${edit_token} yarn start"; then
+if ! kubectl exec -it "$pod" -- /bin/sh -c "INTEGRATION_ENTRYPOINT=http://kubeapps-ci.kubeapps ADMIN_TOKEN=${admin_token} VIEW_TOKEN=${view_token} EDIT_TOKEN=${edit_token} yarn start ${ignoreFlag}"; then
   ## Integration tests failed, get report screenshot
   warn "PODS status on failure"
   kubectl cp "${pod}:/app/reports" ./reports

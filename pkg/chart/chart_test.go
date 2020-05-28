@@ -117,22 +117,25 @@ func TestParseDetails(t *testing.T) {
 			name: "parses request including app repo resource",
 			data: `{
 				"appRepositoryResourceName": "my-chart-repo",
+				"appRepositoryResourceNamespace": "my-repo-namespace",
 	        	"chartName": "test",
 	        	"releaseName": "foo",
 	        	"version": "1.0.0",
 	        	"values": "foo: bar"
 	        }`,
 			expected: &Details{
-				AppRepositoryResourceName: "my-chart-repo",
-				ChartName:                 "test",
-				ReleaseName:               "foo",
-				Version:                   "1.0.0",
-				Values:                    "foo: bar",
+				AppRepositoryResourceName:      "my-chart-repo",
+				AppRepositoryResourceNamespace: "my-repo-namespace",
+				ChartName:                      "test",
+				ReleaseName:                    "foo",
+				Version:                        "1.0.0",
+				Values:                         "foo: bar",
 			},
 		},
 		{
 			name: "errors if appRepositoryResourceName is not present",
 			data: `{
+				"appRepositoryResourceNamespace": "my-repo-namespace",
 				"chartName": "test",
 				"releaseName": "foo",
 				"version": "1.0.0",
@@ -144,6 +147,19 @@ func TestParseDetails(t *testing.T) {
 			name: "errors if appRepositoryResourceName is empty",
 			data: `{
 				"appRepositoryResourceName": "",
+				"appRepositoryResourceNamespace": "my-repo-namespace",
+				"chartName": "test",
+				"releaseName": "foo",
+				"version": "1.0.0",
+				"values": "foo: bar"
+			}`,
+			err: true,
+		},
+		{
+			name: "errors if appRepositoryResourceNamespace is empty",
+			data: `{
+				"appRepositoryResourceName": "my-repo",
+				"appRepositoryResourceNamespace": "",
 				"chartName": "test",
 				"releaseName": "foo",
 				"version": "1.0.0",
@@ -181,7 +197,7 @@ func fakeLoadChartV2(in io.Reader) (*chartv2.Chart, error) {
 	return &chartv2.Chart{}, nil
 }
 
-func TestparseDetailsForHTTPClient(t *testing.T) {
+func TestParseDetailsForHTTPClient(t *testing.T) {
 	systemCertPool, err := x509.SystemCertPool()
 	if err != nil {
 		t.Fatalf("%+v", err)
@@ -193,6 +209,7 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		customCASecretName   = "custom-ca-secret-name"
 		customCASecretData   = "some-cert-data"
 		appRepoName          = "custom-repo"
+		appRepoNamespace     = "my-namespace"
 	)
 
 	testCases := []struct {
@@ -205,14 +222,16 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		{
 			name: "default cert pool without auth",
 			details: &Details{
-				AppRepositoryResourceName: appRepoName,
+				AppRepositoryResourceName:      appRepoName,
+				AppRepositoryResourceNamespace: appRepoNamespace,
 			},
 			numCertsExpected: len(systemCertPool.Subjects()),
 		},
 		{
 			name: "custom CA added when passed an AppRepository CRD",
 			details: &Details{
-				AppRepositoryResourceName: appRepoName,
+				AppRepositoryResourceName:      appRepoName,
+				AppRepositoryResourceNamespace: appRepoNamespace,
 			},
 			appRepoSpec: appRepov1.AppRepositorySpec{
 				Auth: appRepov1.AppRepositoryAuth{
@@ -230,7 +249,8 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		{
 			name: "errors if secret for custom CA secret cannot be found",
 			details: &Details{
-				AppRepositoryResourceName: appRepoName,
+				AppRepositoryResourceName:      appRepoName,
+				AppRepositoryResourceNamespace: appRepoNamespace,
 			},
 			appRepoSpec: appRepov1.AppRepositorySpec{
 				Auth: appRepov1.AppRepositoryAuth{
@@ -248,7 +268,8 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		{
 			name: "authorization header added when passed an AppRepository CRD",
 			details: &Details{
-				AppRepositoryResourceName: appRepoName,
+				AppRepositoryResourceName:      appRepoName,
+				AppRepositoryResourceNamespace: appRepoNamespace,
 			},
 			appRepoSpec: appRepov1.AppRepositorySpec{
 				Auth: appRepov1.AppRepositoryAuth{
@@ -266,7 +287,8 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		{
 			name: "errors if auth secret cannot be found",
 			details: &Details{
-				AppRepositoryResourceName: appRepoName,
+				AppRepositoryResourceName:      appRepoName,
+				AppRepositoryResourceNamespace: appRepoNamespace,
 			},
 			appRepoSpec: appRepov1.AppRepositorySpec{
 				Auth: appRepov1.AppRepositoryAuth{
@@ -288,15 +310,15 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		secrets := []*corev1.Secret{&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      customCASecretName,
-				Namespace: metav1.NamespaceSystem,
+				Namespace: appRepoNamespace,
 			},
 			Data: map[string][]byte{
-				"custom-secret-key": []byte(customCASecretData),
+				"custom-secret-key": []byte(customCASecretName),
 			},
 		}, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      authHeaderSecretName,
-				Namespace: metav1.NamespaceSystem,
+				Namespace: appRepoNamespace,
 			},
 			Data: map[string][]byte{
 				"custom-secret-key": []byte(authHeaderSecretData),
@@ -306,7 +328,7 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		apprepos := []*appRepov1.AppRepository{&appRepov1.AppRepository{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      tc.details.AppRepositoryResourceName,
-				Namespace: metav1.NamespaceSystem,
+				Namespace: appRepoNamespace,
 			},
 			Spec: tc.appRepoSpec,
 		}}
@@ -317,7 +339,7 @@ func TestparseDetailsForHTTPClient(t *testing.T) {
 		}
 
 		t.Run(tc.name, func(t *testing.T) {
-			appRepo, caCertSecret, authSecret, err := chUtils.parseDetailsForHTTPClient(tc.details)
+			appRepo, caCertSecret, authSecret, err := chUtils.parseDetailsForHTTPClient(tc.details, "dummy-user-token")
 
 			if err != nil {
 				if tc.errorExpected {
@@ -619,6 +641,154 @@ func TestClientWithDefaultHeaders(t *testing.T) {
 
 			if got, want := requestWithHeader.Header, tc.expectedHeaders; !cmp.Equal(got, want) {
 				t.Errorf(cmp.Diff(want, got))
+			}
+		})
+	}
+}
+
+func TestGetRegistrySecretsPerDomain(t *testing.T) {
+	const (
+		userAuthToken = "ignored"
+		namespace     = "user-namespace"
+		// Secret created with
+		// k create secret docker-registry test-secret --dry-run --docker-email=a@b.com --docker-password='password' --docker-username='username' --docker-server='https://index.docker.io/v1/' -o yaml
+		indexDockerIOCred   = `{"auths":{"https://index.docker.io/v1/":{"username":"username","password":"password","email":"a@b.com","auth":"dXNlcm5hbWU6cGFzc3dvcmQ="}}}`
+		otherExampleComCred = `{"auths":{"other.example.com":{"username":"username","password":"password","email":"a@b.com","auth":"dXNlcm5hbWU6cGFzc3dvcmQ="}}}`
+	)
+
+	testCases := []struct {
+		name             string
+		secretNames      []string
+		existingSecrets  []*corev1.Secret
+		secretsPerDomain map[string]string
+		expectError      bool
+	}{
+		{
+			name:             "it returns an empty map if there are no secret names",
+			secretNames:      nil,
+			secretsPerDomain: map[string]string{},
+		},
+		{
+			name:        "it returns an error if a secret does not exist",
+			secretNames: []string{"should-exist"},
+			expectError: true,
+		},
+		{
+			name:        "it returns an error if the secret is not a dockerConfigJSON type",
+			secretNames: []string{"bitnami-repo"},
+			existingSecrets: []*corev1.Secret{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo",
+						Namespace: namespace,
+					},
+					Type: "Opaque",
+					Data: map[string][]byte{
+						dockerConfigJSONKey: []byte("whatevs"),
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name:        "it returns an error if the secret data does not have .dockerconfigjson key",
+			secretNames: []string{"bitnami-repo"},
+			existingSecrets: []*corev1.Secret{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo",
+						Namespace: namespace,
+					},
+					Type: "Opaque",
+					Data: map[string][]byte{
+						"custom-secret-key": []byte("whatevs"),
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name:        "it returns an error if the secret .dockerconfigjson value is not json decodable",
+			secretNames: []string{"bitnami-repo"},
+			existingSecrets: []*corev1.Secret{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo",
+						Namespace: namespace,
+					},
+					Type: "Opaque",
+					Data: map[string][]byte{
+						dockerConfigJSONKey: []byte("not json"),
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name:        "it returns the registry secrets per domain",
+			secretNames: []string{"bitnami-repo"},
+			existingSecrets: []*corev1.Secret{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo",
+						Namespace: namespace,
+					},
+					Type: dockerConfigJSONType,
+					Data: map[string][]byte{
+						dockerConfigJSONKey: []byte(indexDockerIOCred),
+					},
+				},
+			},
+			secretsPerDomain: map[string]string{
+				"https://index.docker.io/v1/": "bitnami-repo",
+			},
+		},
+		{
+			name:        "it includes secrets for multiple servers",
+			secretNames: []string{"bitnami-repo1", "bitnami-repo2"},
+			existingSecrets: []*corev1.Secret{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo1",
+						Namespace: namespace,
+					},
+					Type: dockerConfigJSONType,
+					Data: map[string][]byte{
+						dockerConfigJSONKey: []byte(indexDockerIOCred),
+					},
+				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "bitnami-repo2",
+						Namespace: namespace,
+					},
+					Type: dockerConfigJSONType,
+					Data: map[string][]byte{
+						dockerConfigJSONKey: []byte(otherExampleComCred),
+					},
+				},
+			},
+			secretsPerDomain: map[string]string{
+				"https://index.docker.io/v1/": "bitnami-repo1",
+				"other.example.com":           "bitnami-repo2",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &kube.FakeHandler{Secrets: tc.existingSecrets}
+
+			secretsPerDomain, err := getRegistrySecretsPerDomain(tc.secretNames, namespace, "token", client)
+			if got, want := err != nil, tc.expectError; !cmp.Equal(got, want) {
+				t.Fatalf("got: %t, want: %t, err was: %+v", got, want, err)
+			}
+			if err != nil {
+				return
+			}
+
+			if got, want := secretsPerDomain, tc.secretsPerDomain; !cmp.Equal(want, got) {
+				t.Errorf("mismatch (-want +got):\n%s", cmp.Diff(want, got))
 			}
 		})
 	}

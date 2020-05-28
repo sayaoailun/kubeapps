@@ -19,9 +19,6 @@ package kube
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
-	"strings"
 
 	v1alpha1 "github.com/kubeapps/kubeapps/cmd/apprepository-controller/pkg/apis/apprepository/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,8 +28,10 @@ import (
 type FakeHandler struct {
 	AppRepos    []*v1alpha1.AppRepository
 	CreatedRepo *v1alpha1.AppRepository
+	UpdatedRepo *v1alpha1.AppRepository
 	Namespaces  []corev1.Namespace
 	Secrets     []*corev1.Secret
+	ValRes      *ValidationResponse
 	Err         error
 }
 
@@ -50,6 +49,11 @@ func (c *FakeHandler) AsSVC() handler {
 func (c *FakeHandler) CreateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*v1alpha1.AppRepository, error) {
 	c.AppRepos = append(c.AppRepos, c.CreatedRepo)
 	return c.CreatedRepo, c.Err
+}
+
+// UpdateAppRepository fake
+func (c *FakeHandler) UpdateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*v1alpha1.AppRepository, error) {
+	return c.UpdatedRepo, c.Err
 }
 
 // DeleteAppRepository fake
@@ -83,8 +87,8 @@ func (c *FakeHandler) GetSecret(name, namespace string) (*corev1.Secret, error) 
 }
 
 // ValidateAppRepository fake
-func (c *FakeHandler) ValidateAppRepository(appRepoBody io.ReadCloser) (*http.Response, error) {
-	return &http.Response{Body: ioutil.NopCloser(strings.NewReader("valid: yaml")), StatusCode: 200}, c.Err
+func (c *FakeHandler) ValidateAppRepository(appRepoBody io.ReadCloser, requestNamespace string) (*ValidationResponse, error) {
+	return c.ValRes, c.Err
 }
 
 // GetOperatorLogo fake

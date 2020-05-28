@@ -18,7 +18,6 @@ package httphandler
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
@@ -42,14 +41,22 @@ type appRepositoryResponse struct {
 	AppRepository v1alpha1.AppRepository `json:"appRepository"`
 }
 
+// JSONError returns an error code and a JSON response
+func JSONError(w http.ResponseWriter, err interface{}, code int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(err)
+}
+
 func returnK8sError(err error, w http.ResponseWriter) {
 	if statusErr, ok := err.(*k8sErrors.StatusError); ok {
 		status := statusErr.ErrStatus
 		log.Infof("unable to create app repo: %v", status.Reason)
-		http.Error(w, status.Message, int(status.Code))
+		JSONError(w, statusErr.ErrStatus, int(status.Code))
 	} else {
 		log.Errorf("unable to create app repo: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		JSONError(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
@@ -69,7 +76,30 @@ func CreateAppRepository(handler kube.AuthHandler) func(w http.ResponseWriter, r
 		}
 		responseBody, err := json.Marshal(response)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			JSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(responseBody)
+	}
+}
+
+// UpdateAppRepository updates an App Repository
+func UpdateAppRepository(handler kube.AuthHandler) func(w http.ResponseWriter, req *http.Request) {
+	return func(w http.ResponseWriter, req *http.Request) {
+		requestNamespace := mux.Vars(req)["namespace"]
+		token := auth.ExtractToken(req.Header.Get("Authorization"))
+		appRepo, err := handler.AsUser(token).UpdateAppRepository(req.Body, requestNamespace)
+		if err != nil {
+			returnK8sError(err, w)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		response := appRepositoryResponse{
+			AppRepository: *appRepo,
+		}
+		responseBody, err := json.Marshal(response)
+		if err != nil {
+			JSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Write(responseBody)
@@ -80,22 +110,17 @@ func CreateAppRepository(handler kube.AuthHandler) func(w http.ResponseWriter, r
 func ValidateAppRepository(handler kube.AuthHandler) func(w http.ResponseWriter, req *http.Request) {
 	return func(w http.ResponseWriter, req *http.Request) {
 		token := auth.ExtractToken(req.Header.Get("Authorization"))
-		res, err := handler.AsUser(token).ValidateAppRepository(req.Body)
+		res, err := handler.AsUser(token).ValidateAppRepository(req.Body, mux.Vars(req)["namespace"])
 		if err != nil {
 			returnK8sError(err, w)
 			return
 		}
-		body, err := ioutil.ReadAll(res.Body)
+		responseBody, err := json.Marshal(res)
 		if err != nil {
-			returnK8sError(err, w)
+			JSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(res.StatusCode)
-		if res.StatusCode == 200 {
-			w.Write([]byte("OK"))
-		} else {
-			w.Write(body)
-		}
+		w.Write(responseBody)
 	}
 }
 
@@ -127,7 +152,7 @@ func GetNamespaces(kubeHandler kube.AuthHandler) func(w http.ResponseWriter, req
 		}
 		responseBody, err := json.Marshal(response)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			JSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Write(responseBody)
@@ -141,7 +166,7 @@ func GetOperatorLogo(kubeHandler kube.AuthHandler) func(w http.ResponseWriter, r
 		name := mux.Vars(req)["name"]
 		logo, err := kubeHandler.AsSVC().GetOperatorLogo(ns, name)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			JSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		ctype := http.DetectContentType(logo)
@@ -163,6 +188,7 @@ func SetupDefaultRoutes(r *mux.Router) error {
 	r.Methods("GET").Path("/namespaces").Handler(http.HandlerFunc(GetNamespaces(backendHandler)))
 	r.Methods("POST").Path("/namespaces/{namespace}/apprepositories").Handler(http.HandlerFunc(CreateAppRepository(backendHandler)))
 	r.Methods("POST").Path("/namespaces/{namespace}/apprepositories/validate").Handler(http.HandlerFunc(ValidateAppRepository(backendHandler)))
+	r.Methods("PUT").Path("/namespaces/{namespace}/apprepositories/{name}").Handler(http.HandlerFunc(UpdateAppRepository(backendHandler)))
 	r.Methods("DELETE").Path("/namespaces/{namespace}/apprepositories/{name}").Handler(http.HandlerFunc(DeleteAppRepository(backendHandler)))
 	r.Methods("GET").Path("/namespaces/{namespace}/operator/{name}/logo").Handler(http.HandlerFunc(GetOperatorLogo(backendHandler)))
 	return nil

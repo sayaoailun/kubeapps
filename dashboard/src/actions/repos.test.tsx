@@ -15,6 +15,14 @@ let store: any;
 const appRepo = { spec: { resyncRequests: 10000 } };
 const kubeappsNamespace = "kubeapps-namespace";
 
+const safeYAMLTemplate = `
+spec:
+  containers:
+    - env:
+      - name: FOO
+        value: BAR
+`;
+
 beforeEach(() => {
   store = mockStore({
     config: { namespace: kubeappsNamespace },
@@ -32,6 +40,9 @@ beforeEach(() => {
     return { appRepository: { metadata: { name: "repo-abc" } } };
   });
   Secret.create = jest.fn();
+  Secret.list = jest.fn(() => {
+    return { items: [] };
+  });
 });
 
 afterEach(jest.resetAllMocks);
@@ -169,7 +180,7 @@ describe("resyncRepo", () => {
   });
 
   it("dispatches errorRepos if error on #update", async () => {
-    AppRepository.update = jest.fn().mockImplementationOnce(() => {
+    AppRepository.resync = jest.fn().mockImplementationOnce(() => {
       throw new Error("Boom!");
     });
 
@@ -188,7 +199,7 @@ describe("resyncRepo", () => {
 describe("resyncAllRepos", () => {
   it("resyncs each repo using its namespace", async () => {
     const appRepoGetMock = jest.fn();
-    AppRepository.get = appRepoGetMock;
+    AppRepository.resync = appRepoGetMock;
     await store.dispatch(
       repoActions.resyncAllRepos([
         {
@@ -220,25 +231,56 @@ describe("fetchRepos", () => {
         type: getType(repoActions.receiveRepos),
         payload: { foo: "bar" },
       },
+      {
+        type: getType(repoActions.receiveReposSecrets),
+        payload: [],
+      },
     ];
 
     await store.dispatch(repoActions.fetchRepos(namespace));
     expect(store.getActions()).toEqual(expectedActions);
   });
 
-  it("defaults to apprepos in kubeapps own namespace if none specified", async () => {
+  it("includes secrets that are owned by an apprepo", async () => {
+    const appRepoSecret = {
+      metadata: {
+        name: "foo",
+        ownerReferences: [
+          {
+            kind: "AppRepository",
+          },
+        ],
+      },
+    };
+    const otherSecret = {
+      metadata: {
+        name: "bar",
+        ownerReferences: [
+          {
+            kind: "Other",
+          },
+        ],
+      },
+    };
+    Secret.list = jest.fn(() => {
+      return { items: [appRepoSecret, otherSecret] };
+    });
     const expectedActions = [
       {
         type: getType(repoActions.requestRepos),
-        payload: kubeappsNamespace,
+        payload: namespace,
       },
       {
         type: getType(repoActions.receiveRepos),
         payload: { foo: "bar" },
       },
+      {
+        type: getType(repoActions.receiveReposSecrets),
+        payload: [appRepoSecret],
+      },
     ];
 
-    await store.dispatch(repoActions.fetchRepos());
+    await store.dispatch(repoActions.fetchRepos(namespace));
     expect(store.getActions()).toEqual(expectedActions);
   });
 
@@ -271,6 +313,7 @@ describe("installRepo", () => {
     "",
     "",
     "",
+    [],
   );
 
   context("when authHeader provided", () => {
@@ -281,6 +324,7 @@ describe("installRepo", () => {
       "Bearer: abc",
       "",
       "",
+      [],
     );
 
     it("calls AppRepository create including a auth struct", async () => {
@@ -292,6 +336,7 @@ describe("installRepo", () => {
         "Bearer: abc",
         "",
         {},
+        [],
       );
     });
 
@@ -314,6 +359,7 @@ describe("installRepo", () => {
       "",
       "This is a cert!",
       "",
+      [],
     );
 
     it("calls AppRepository create including a auth struct", async () => {
@@ -325,6 +371,7 @@ describe("installRepo", () => {
         "",
         "This is a cert!",
         {},
+        [],
       );
     });
 
@@ -339,14 +386,6 @@ describe("installRepo", () => {
     });
 
     context("when a pod template is provided", () => {
-      const safeYAMLTemplate = `
-spec:
-  containers:
-    - env:
-      - name: FOO
-        value: BAR
-`;
-
       it("calls AppRepository create including pod template", async () => {
         await store.dispatch(
           repoActions.installRepo(
@@ -356,6 +395,7 @@ spec:
             "",
             "",
             safeYAMLTemplate,
+            [],
           ),
         );
 
@@ -368,6 +408,7 @@ spec:
           {
             spec: { containers: [{ env: [{ name: "FOO", value: "BAR" }] }] },
           },
+          [],
         );
       });
 
@@ -384,6 +425,7 @@ spec:
             "",
             "",
             unsafeYAMLTemplate,
+            [],
           ),
         );
         expect(AppRepository.create).not.toHaveBeenCalled();
@@ -401,6 +443,7 @@ spec:
         "",
         "",
         {},
+        [],
       );
     });
 
@@ -454,7 +497,9 @@ spec:
   });
 
   it("uses kubeapps own namespace if namespace is _all", async () => {
-    await store.dispatch(repoActions.installRepo("my-repo", "_all", "http://foo.bar", "", "", ""));
+    await store.dispatch(
+      repoActions.installRepo("my-repo", "_all", "http://foo.bar", "", "", "", []),
+    );
 
     expect(AppRepository.create).toHaveBeenCalledWith(
       "my-repo",
@@ -463,7 +508,152 @@ spec:
       "",
       "",
       {},
+      [],
     );
+  });
+
+  it("includes registry secrets if given", async () => {
+    await store.dispatch(
+      repoActions.installRepo("my-repo", "_all", "http://foo.bar", "", "", "", ["repo-1"]),
+    );
+
+    expect(AppRepository.create).toHaveBeenCalledWith(
+      "my-repo",
+      "kubeapps-namespace",
+      "http://foo.bar",
+      "",
+      "",
+      {},
+      ["repo-1"],
+    );
+  });
+});
+
+describe("updateRepo", () => {
+  it("updates a repo with an auth header", async () => {
+    const r = {
+      metadata: { name: "repo-abc" },
+      spec: { auth: { header: { secretKeyRef: { name: "apprepo-repo-abc" } } } },
+    };
+    const secret = { metadata: { name: "apprepo-repo-abc" } };
+    AppRepository.update = jest.fn(() => {
+      return { appRepository: r };
+    });
+    Secret.get = jest.fn(() => {
+      return secret;
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.requestRepoUpdate),
+      },
+      {
+        type: getType(repoActions.repoUpdated),
+        payload: r,
+      },
+      {
+        type: getType(repoActions.receiveReposSecret),
+        payload: secret,
+      },
+    ];
+
+    await store.dispatch(
+      repoActions.updateRepo(
+        "my-repo",
+        "my-namespace",
+        "http://foo.bar",
+        "foo",
+        "bar",
+        safeYAMLTemplate,
+        ["repo-1"],
+      ),
+    );
+    expect(store.getActions()).toEqual(expectedActions);
+    expect(AppRepository.update).toHaveBeenCalledWith(
+      "my-repo",
+      "my-namespace",
+      "http://foo.bar",
+      "foo",
+      "bar",
+      { spec: { containers: [{ env: [{ name: "FOO", value: "BAR" }] }] } },
+      ["repo-1"],
+    );
+  });
+
+  it("updates a repo with an customCA", async () => {
+    const r = {
+      metadata: { name: "repo-abc" },
+      spec: { auth: { customCA: { secretKeyRef: { name: "apprepo-repo-abc" } } } },
+    };
+    const secret = { metadata: { name: "apprepo-repo-abc" } };
+    AppRepository.update = jest.fn(() => {
+      return { appRepository: r };
+    });
+    Secret.get = jest.fn(() => {
+      return secret;
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.requestRepoUpdate),
+      },
+      {
+        type: getType(repoActions.repoUpdated),
+        payload: r,
+      },
+      {
+        type: getType(repoActions.receiveReposSecret),
+        payload: secret,
+      },
+    ];
+
+    await store.dispatch(
+      repoActions.updateRepo(
+        "my-repo",
+        "my-namespace",
+        "http://foo.bar",
+        "foo",
+        "bar",
+        safeYAMLTemplate,
+        ["repo-1"],
+      ),
+    );
+    expect(store.getActions()).toEqual(expectedActions);
+    expect(AppRepository.update).toHaveBeenCalledWith(
+      "my-repo",
+      "my-namespace",
+      "http://foo.bar",
+      "foo",
+      "bar",
+      { spec: { containers: [{ env: [{ name: "FOO", value: "BAR" }] }] } },
+      ["repo-1"],
+    );
+  });
+
+  it("returns an error if failed", async () => {
+    AppRepository.update = jest.fn(() => {
+      throw new Error("boom");
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.requestRepoUpdate),
+      },
+      {
+        type: getType(repoActions.errorRepos),
+        payload: { err: new Error("boom"), op: "update" },
+      },
+    ];
+
+    await store.dispatch(
+      repoActions.updateRepo(
+        "my-repo",
+        "my-namespace",
+        "http://foo.bar",
+        "foo",
+        "bar",
+        safeYAMLTemplate,
+        [],
+      ),
+    );
+    expect(store.getActions()).toEqual(expectedActions);
   });
 });
 
@@ -480,8 +670,9 @@ describe("checkChart", () => {
       },
     ];
 
-    await store.dispatch(repoActions.checkChart("my-repo", "my-chart"));
+    await store.dispatch(repoActions.checkChart(kubeappsNamespace, "my-repo", "my-chart"));
     expect(store.getActions()).toEqual(expectedActions);
+    expect(Chart.fetchChartVersions).toBeCalledWith("kubeapps-namespace", "my-repo/my-chart");
   });
 
   it("dispatches requestRepo and errorChart if error fetching", async () => {
@@ -499,21 +690,24 @@ describe("checkChart", () => {
       },
     ];
 
-    await store.dispatch(repoActions.checkChart("my-repo", "my-chart"));
+    await store.dispatch(repoActions.checkChart(kubeappsNamespace, "my-repo", "my-chart"));
     expect(store.getActions()).toEqual(expectedActions);
+    expect(Chart.fetchChartVersions).toBeCalledWith("kubeapps-namespace", "my-repo/my-chart");
   });
 });
 
 describe("validateRepo", () => {
   it("dispatches repoValidating and repoValidated if no error", async () => {
-    AppRepository.validate = jest.fn(() => "OK");
+    AppRepository.validate = jest.fn(() => {
+      return { code: 200, message: "OK" };
+    });
     const expectedActions = [
       {
         type: getType(repoActions.repoValidating),
       },
       {
         type: getType(repoActions.repoValidated),
-        payload: "OK",
+        payload: { code: 200, message: "OK" },
       },
     ];
 
@@ -543,7 +737,7 @@ describe("validateRepo", () => {
 
   it("dispatches checkRepo and errorRepos when the validation cannot be parsed", async () => {
     AppRepository.validate = jest.fn(() => {
-      return { statusCode: 409 };
+      return { code: 409, message: "forbidden" };
     });
     const expectedActions = [
       {
@@ -552,7 +746,7 @@ describe("validateRepo", () => {
       {
         type: getType(repoActions.errorRepos),
         payload: {
-          err: new Error('Unable to parse validation response, got: {"statusCode":409}'),
+          err: new Error('{"code":409,"message":"forbidden"}'),
           op: "validate",
         },
       },
@@ -560,5 +754,88 @@ describe("validateRepo", () => {
     const res = await store.dispatch(repoActions.validateRepo("url", "auth", "cert"));
     expect(store.getActions()).toEqual(expectedActions);
     expect(res).toBe(false);
+  });
+});
+
+describe("fetchImagePullSecrets", () => {
+  it("fetches image pull secrets", async () => {
+    const secret1 = {
+      type: "kubernetes.io/dockerconfigjson",
+    };
+    const secret2 = {
+      type: "Opaque",
+    };
+    Secret.list = jest.fn(() => {
+      return {
+        items: [secret1, secret2],
+      };
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.requestImagePullSecrets),
+        payload: "default",
+      },
+      {
+        type: getType(repoActions.receiveImagePullSecrets),
+        payload: [secret1],
+      },
+    ];
+    await store.dispatch(repoActions.fetchImagePullSecrets("default"));
+    expect(store.getActions()).toEqual(expectedActions);
+  });
+
+  it("dispatches an error", async () => {
+    Secret.list = jest.fn(() => {
+      throw new Error("boom");
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.requestImagePullSecrets),
+        payload: "default",
+      },
+      {
+        type: getType(repoActions.errorRepos),
+        payload: {
+          err: new Error("boom"),
+          op: "fetch",
+        },
+      },
+    ];
+    await store.dispatch(repoActions.fetchImagePullSecrets("default"));
+    expect(store.getActions()).toEqual(expectedActions);
+  });
+});
+
+describe("createDockerRegistrySecret", () => {
+  it("creates a docker registry", async () => {
+    const secret = {
+      type: "kubernetes.io/dockerconfigjson",
+    };
+    Secret.createPullSecret = jest.fn(() => secret);
+    const expectedActions = [
+      {
+        type: getType(repoActions.createImagePullSecret),
+        payload: secret,
+      },
+    ];
+    await store.dispatch(repoActions.createDockerRegistrySecret("", "", "", "", "", ""));
+    expect(store.getActions()).toEqual(expectedActions);
+  });
+
+  it("dispatches an error", async () => {
+    Secret.createPullSecret = jest.fn(() => {
+      throw new Error("boom");
+    });
+    const expectedActions = [
+      {
+        type: getType(repoActions.errorRepos),
+        payload: {
+          err: new Error("boom"),
+          op: "fetch",
+        },
+      },
+    ];
+    await store.dispatch(repoActions.createDockerRegistrySecret("", "", "", "", "", ""));
+    expect(store.getActions()).toEqual(expectedActions);
   });
 });

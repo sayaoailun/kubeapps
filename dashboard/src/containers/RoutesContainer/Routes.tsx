@@ -10,7 +10,9 @@ import CatalogContainer from "../../containers/CatalogContainer";
 import ChartViewContainer from "../../containers/ChartViewContainer";
 import LoginFormContainer from "../../containers/LoginFormContainer";
 import OperatorInstanceCreateContainer from "../../containers/OperatorInstanceCreateContainer";
+import OperatorInstanceUpdateContainer from "../../containers/OperatorInstanceUpdateContainer";
 import OperatorInstanceViewContainer from "../../containers/OperatorInstanceViewContainer";
+import OperatorNewContainer from "../../containers/OperatorNewContainer";
 import OperatorsListContainer from "../../containers/OperatorsListContainer";
 import OperatorViewContainer from "../../containers/OperatorViewContainer";
 import PrivateRouteContainer from "../../containers/PrivateRouteContainer";
@@ -24,19 +26,22 @@ import ServiceInstanceViewContainer from "../../containers/ServiceInstanceViewCo
 type IRouteComponentPropsAndRouteProps = RouteProps & RouteComponentProps<any>;
 
 const privateRoutes = {
-  "/apps/ns/:namespace": AppListContainer,
-  "/apps/ns/:namespace/:releaseName": AppViewContainer,
-  "/apps/ns/:namespace/new/:repo/:id/versions/:version": AppNewContainer,
-  "/apps/ns/:namespace/upgrade/:releaseName": AppUpgradeContainer,
-  "/catalog": CatalogContainer,
-  "/catalog/:repo": CatalogContainer,
-  "/charts/:repo/:id": ChartViewContainer,
-  "/charts/:repo/:id/versions/:version": ChartViewContainer,
+  "/ns/:namespace/apps": AppListContainer,
+  "/ns/:namespace/apps/:releaseName": AppViewContainer,
+  "/ns/:namespace/apps/:releaseName/upgrade": AppUpgradeContainer,
+  "/ns/:namespace/apps/new/:repo/:id/versions/:version": AppNewContainer,
+  "/ns/:namespace/apps/new-from-:global(global)/:repo/:id/versions/:version": AppNewContainer,
+  "/ns/:namespace/catalog": CatalogContainer,
+  "/ns/:namespace/catalog/:repo": CatalogContainer,
+  "/ns/:namespace/charts/:repo/:id": ChartViewContainer,
+  "/ns/:namespace/:global(global)-charts/:repo/:id": ChartViewContainer,
+  "/ns/:namespace/charts/:repo/:id/versions/:version": ChartViewContainer,
+  "/ns/:namespace/:global(global)-charts/:repo/:id/versions/:version": ChartViewContainer,
   "/config/brokers": ServiceBrokerListContainer,
   "/services/brokers/:brokerName/classes/:className": ServiceClassViewContainer,
   "/services/brokers/:brokerName/instances/ns/:namespace/:instanceName": ServiceInstanceViewContainer,
   "/services/classes": ServiceClassListContainer,
-  "/services/instances/ns/:namespace": ServiceInstanceListContainer,
+  "/ns/:namespace/services/instances": ServiceInstanceListContainer,
 } as const;
 
 // Public routes that don't require authentication
@@ -66,10 +71,12 @@ class Routes extends React.Component<IRoutesProps> {
     if (this.props.featureFlags.operators) {
       // Add routes related to operators
       Object.assign(privateRoutes, {
-        "/operators/ns/:namespace": OperatorsListContainer,
-        "/operators/ns/:namespace/:operator": OperatorViewContainer,
-        "/operators-instances/ns/:namespace/:instanceName": OperatorInstanceViewContainer,
-        "/operators-instances/ns/:namespace/new/:operator/:instanceType": OperatorInstanceCreateContainer,
+        "/ns/:namespace/operators": OperatorsListContainer,
+        "/ns/:namespace/operators/:operator": OperatorViewContainer,
+        "/ns/:namespace/operators/new/:operator": OperatorNewContainer,
+        "/ns/:namespace/operators-instances/new/:csv/:crd": OperatorInstanceCreateContainer,
+        "/ns/:namespace/operators-instances/:csv/:crd/:instanceName": OperatorInstanceViewContainer,
+        "/ns/:namespace/operators-instances/:csv/:crd/:instanceName/update": OperatorInstanceUpdateContainer,
       });
     }
     return (
@@ -94,7 +101,7 @@ class Routes extends React.Component<IRoutesProps> {
   }
   private rootNamespacedRedirect = () => {
     if (this.props.namespace && this.props.authenticated) {
-      return <Redirect to={`/apps/ns/${this.props.namespace}`} />;
+      return <Redirect to={`/ns/${this.props.namespace}/apps`} />;
     }
     // There is not a default namespace, redirect to login page
     return <Redirect to={"/login"} />;

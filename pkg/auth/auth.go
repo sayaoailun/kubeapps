@@ -17,6 +17,7 @@ limitations under the License.
 package auth
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -38,7 +39,6 @@ type resource struct {
 }
 
 type k8sAuthInterface interface {
-	Validate() error
 	GetResourceList(groupVersion string) (*metav1.APIResourceList, error)
 	CanI(verb, group, resource, namespace string) (bool, error)
 }
@@ -48,30 +48,22 @@ type k8sAuth struct {
 	DiscoveryCli discovery.DiscoveryInterface
 }
 
-func (u k8sAuth) Validate() error {
-	_, err := u.AuthCli.SelfSubjectRulesReviews().Create(&authorizationapi.SelfSubjectRulesReview{
-		Spec: authorizationapi.SelfSubjectRulesReviewSpec{
-			Namespace: "default",
-		},
-	})
-	return err
-}
-
 func (u k8sAuth) GetResourceList(groupVersion string) (*metav1.APIResourceList, error) {
 	return u.DiscoveryCli.ServerResourcesForGroupVersion(groupVersion)
 }
 
 func (u k8sAuth) CanI(verb, group, resource, namespace string) (bool, error) {
-	res, err := u.AuthCli.SelfSubjectAccessReviews().Create(&authorizationapi.SelfSubjectAccessReview{
+	attr := &authorizationapi.ResourceAttributes{
+		Group:     group,
+		Resource:  resource,
+		Verb:      verb,
+		Namespace: namespace,
+	}
+	res, err := u.AuthCli.SelfSubjectAccessReviews().Create(context.TODO(), &authorizationapi.SelfSubjectAccessReview{
 		Spec: authorizationapi.SelfSubjectAccessReviewSpec{
-			ResourceAttributes: &authorizationapi.ResourceAttributes{
-				Group:     group,
-				Resource:  resource,
-				Verb:      verb,
-				Namespace: namespace,
-			},
+			ResourceAttributes: attr,
 		},
-	})
+	}, metav1.CreateOptions{})
 	if err != nil {
 		return false, err
 	}
@@ -94,7 +86,7 @@ type Action struct {
 
 // Checker for the exported funcs
 type Checker interface {
-	Validate() error
+	ValidateForNamespace(namespace string) (bool, error)
 	GetForbiddenActions(namespace, action, manifest string) ([]Action, error)
 }
 
@@ -121,9 +113,10 @@ func NewAuth(token string) (*UserAuth, error) {
 	return &UserAuth{k8sAuthCli}, nil
 }
 
-// Validate checks if the given token is valid
-func (u *UserAuth) Validate() error {
-	return u.k8sAuth.Validate()
+// ValidateForNamespace checks if the user can access secrets in the given
+// namespace, as a check of whether they can view the namespace.
+func (u *UserAuth) ValidateForNamespace(namespace string) (bool, error) {
+	return u.k8sAuth.CanI("get", "", "secrets", namespace)
 }
 
 type resourceInfo struct {

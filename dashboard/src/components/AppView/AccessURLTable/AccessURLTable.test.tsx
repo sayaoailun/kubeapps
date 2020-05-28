@@ -5,7 +5,6 @@ import * as React from "react";
 import itBehavesLike from "../../../shared/specs";
 
 import ResourceRef from "shared/ResourceRef";
-import LoadingWrapper from "../../../components/LoadingWrapper";
 import { IIngressSpec, IResource, IServiceSpec, IServiceStatus } from "../../../shared/types";
 import AccessURLItem from "./AccessURLItem";
 import AccessURLTable from "./AccessURLTable";
@@ -51,20 +50,9 @@ context("when fetching ingresses or services", () => {
   });
 });
 
-it("renders a message if there are no services or ingresses", () => {
+it("doesn't render anything if the application has no URL", () => {
   const wrapper = shallow(<AccessURLTable {...defaultProps} />);
-  expect(
-    wrapper
-      .find(LoadingWrapper)
-      .shallow()
-      .find(AccessURLItem),
-  ).not.toExist();
-  expect(
-    wrapper
-      .find(LoadingWrapper)
-      .shallow()
-      .text(),
-  ).toContain("The current application does not expose a public URL");
+  expect(wrapper.find("table")).not.toExist();
 });
 
 context("when the app contains services", () => {
@@ -73,6 +61,7 @@ context("when the app contains services", () => {
       kind: "Service",
       metadata: {
         name: "foo",
+        selfLink: "/services/foo",
       },
       spec: {
         type: "ClusterIP",
@@ -84,12 +73,7 @@ context("when the app contains services", () => {
     } as IResource;
     const services = [{ isFetching: false, item: service }];
     const wrapper = shallow(<AccessURLTable {...defaultProps} services={services} />);
-    expect(
-      wrapper
-        .find(LoadingWrapper)
-        .shallow()
-        .text(),
-    ).toContain("The current application does not expose a public URL");
+    expect(wrapper.text()).toContain("The current application does not expose a public URL");
   });
 
   it("should show the table if any service is a LoadBalancer", () => {
@@ -97,6 +81,7 @@ context("when the app contains services", () => {
       kind: "Service",
       metadata: {
         name: "foo",
+        selfLink: "/services/foo",
       },
       spec: {
         type: "LoadBalancer",
@@ -119,6 +104,7 @@ context("when the app contains ingresses", () => {
       kind: "Ingress",
       metadata: {
         name: "foo",
+        selfLink: "/ingresses/foo",
       },
       spec: {
         rules: [
@@ -144,6 +130,7 @@ context("when the app contains services and ingresses", () => {
       kind: "Service",
       metadata: {
         name: "foo",
+        selfLink: "/services/foo",
       },
       spec: {
         type: "LoadBalancer",
@@ -158,6 +145,7 @@ context("when the app contains services and ingresses", () => {
       kind: "Ingress",
       metadata: {
         name: "foo",
+        selfLink: "/ingresses/foo",
       },
       spec: {
         rules: [

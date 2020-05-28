@@ -4,7 +4,7 @@ import { ThunkAction } from "redux-thunk";
 import { ActionType, createAction } from "typesafe-actions";
 
 import Chart from "../shared/Chart";
-import { IChart, IChartVersion, IStoreState, NotFoundError } from "../shared/types";
+import { ForbiddenError, IChart, IChartVersion, IStoreState, NotFoundError } from "../shared/types";
 
 export const requestCharts = createAction("REQUEST_CHARTS");
 
@@ -63,18 +63,21 @@ export type ChartsAction = ActionType<typeof allActions[number]>;
 function dispatchError(dispatch: Dispatch, err: Error) {
   if (err.message.match("could not find")) {
     dispatch(errorChart(new NotFoundError(err.message)));
+  } else if (err.message.match("Unable to validate user")) {
+    dispatch(errorChart(new ForbiddenError(err.message)));
   } else {
     dispatch(errorChart(err));
   }
 }
 
 export function fetchCharts(
+  namespace: string,
   repo: string,
 ): ThunkAction<Promise<void>, IStoreState, null, ChartsAction> {
   return async dispatch => {
     dispatch(requestCharts());
     try {
-      const charts = await Chart.fetchCharts(repo);
+      const charts = await Chart.fetchCharts(namespace, repo);
       if (charts) {
         dispatch(receiveCharts(charts));
       }
@@ -85,12 +88,13 @@ export function fetchCharts(
 }
 
 export function fetchChartVersions(
+  namespace: string,
   id: string,
 ): ThunkAction<Promise<IChartVersion[] | undefined>, IStoreState, null, ChartsAction> {
   return async dispatch => {
     dispatch(requestCharts());
     try {
-      const versions = await Chart.fetchChartVersions(id);
+      const versions = await Chart.fetchChartVersions(namespace, id);
       if (versions) {
         dispatch(receiveChartVersions(versions));
       }
@@ -102,14 +106,14 @@ export function fetchChartVersions(
   };
 }
 
-async function getChart(id: string, version: string) {
+async function getChart(namespace: string, id: string, version: string) {
   let values = "";
   let schema = {};
-  const chartVersion = await Chart.getChartVersion(id, version);
+  const chartVersion = await Chart.getChartVersion(namespace, id, version);
   if (chartVersion) {
     try {
-      values = await Chart.getValues(id, version);
-      schema = await Chart.getSchema(id, version);
+      values = await Chart.getValues(namespace, id, version);
+      schema = await Chart.getSchema(namespace, id, version);
     } catch (e) {
       if (e.constructor !== NotFoundError) {
         throw e;
@@ -120,13 +124,14 @@ async function getChart(id: string, version: string) {
 }
 
 export function getChartVersion(
+  namespace: string,
   id: string,
   version: string,
 ): ThunkAction<Promise<void>, IStoreState, null, ChartsAction> {
   return async dispatch => {
     try {
       dispatch(requestCharts());
-      const { chartVersion, values, schema } = await getChart(id, version);
+      const { chartVersion, values, schema } = await getChart(namespace, id, version);
       if (chartVersion) {
         dispatch(selectChartVersion(chartVersion, values, schema));
       }
@@ -137,13 +142,14 @@ export function getChartVersion(
 }
 
 export function getDeployedChartVersion(
+  namespace: string,
   id: string,
   version: string,
 ): ThunkAction<Promise<void>, IStoreState, null, ChartsAction> {
   return async dispatch => {
     try {
       dispatch(requestDeployedChartVersion());
-      const { chartVersion, values, schema } = await getChart(id, version);
+      const { chartVersion, values, schema } = await getChart(namespace, id, version);
       if (chartVersion) {
         dispatch(receiveDeployedChartVersion(chartVersion, values, schema));
       }
@@ -154,11 +160,12 @@ export function getDeployedChartVersion(
 }
 
 export function fetchChartVersionsAndSelectVersion(
+  namespace: string,
   id: string,
   version?: string,
 ): ThunkAction<Promise<void>, IStoreState, null, ChartsAction> {
   return async dispatch => {
-    const versions = (await dispatch(fetchChartVersions(id))) as IChartVersion[];
+    const versions = (await dispatch(fetchChartVersions(namespace, id))) as IChartVersion[];
     if (versions) {
       let cv: IChartVersion = versions[0];
       if (version) {
@@ -174,12 +181,13 @@ export function fetchChartVersionsAndSelectVersion(
 }
 
 export function getChartReadme(
+  namespace: string,
   id: string,
   version: string,
 ): ThunkAction<Promise<void>, IStoreState, null, ChartsAction> {
   return async dispatch => {
     try {
-      const readme = await Chart.getReadme(id, version);
+      const readme = await Chart.getReadme(namespace, id, version);
       dispatch(selectReadme(readme));
     } catch (e) {
       dispatch(errorReadme(e.toString()));

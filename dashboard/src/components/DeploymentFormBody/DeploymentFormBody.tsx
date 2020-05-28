@@ -18,6 +18,7 @@ import Differential from "./Differential";
 import "./Tabs.css";
 
 export interface IDeploymentFormBodyProps {
+  chartNamespace: string;
   chartID: string;
   chartVersion: string;
   deployedValues?: string;
@@ -27,7 +28,7 @@ export interface IDeploymentFormBodyProps {
   appValues: string;
   push: (location: string) => RouterAction;
   goBack?: () => RouterAction;
-  getChartVersion: (id: string, chartVersion: string) => void;
+  getChartVersion: (namespace: string, id: string, chartVersion: string) => void;
   setValues: (values: string) => void;
   setValuesModified: () => void;
 }
@@ -48,16 +49,23 @@ class DeploymentFormBody extends React.Component<
   };
 
   public componentDidMount() {
-    const { chartID, getChartVersion, chartVersion } = this.props;
-    getChartVersion(chartID, chartVersion);
+    const { chartID, chartNamespace, getChartVersion, chartVersion } = this.props;
+    getChartVersion(chartNamespace, chartID, chartVersion);
   }
 
   public componentDidUpdate = (prevProps: IDeploymentFormBodyProps) => {
-    const { chartID, chartVersion, getChartVersion, selected, appValues } = this.props;
+    const {
+      chartID,
+      chartNamespace,
+      chartVersion,
+      getChartVersion,
+      selected,
+      appValues,
+    } = this.props;
 
     if (chartVersion !== prevProps.chartVersion) {
       // New version detected
-      getChartVersion(chartID, chartVersion);
+      getChartVersion(chartNamespace, chartID, chartVersion);
       return;
     }
 
@@ -140,11 +148,11 @@ class DeploymentFormBody extends React.Component<
     const isUpgradeForm = !!this.props.releaseVersion;
 
     if (isUpgradeForm) {
-      const { chartID, getChartVersion } = this.props;
-      getChartVersion(chartID, e.currentTarget.value);
+      const { chartID, chartNamespace, getChartVersion } = this.props;
+      getChartVersion(chartNamespace, chartID, e.currentTarget.value);
     } else {
       this.props.push(
-        `/apps/ns/${this.props.namespace}/new/${this.props.chartID}/versions/${e.currentTarget.value}`,
+        `/ns/${this.props.namespace}/apps/new/${this.props.chartID}/versions/${e.currentTarget.value}`,
       );
     }
   };
@@ -200,7 +208,11 @@ class DeploymentFormBody extends React.Component<
             <AdvancedDeploymentForm
               appValues={this.props.appValues}
               handleValuesChange={this.handleValuesChange}
-            />
+            >
+              <p>
+                <b>Note:</b> Only comments from the original chart values will be preserved.
+              </p>
+            </AdvancedDeploymentForm>
           </TabPanel>
           <TabPanel>{this.renderDiff()}</TabPanel>
         </Tabs>

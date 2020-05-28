@@ -6,6 +6,35 @@ It is possible to use a private Helm repository to store your own Helm charts an
 - [Harbor](#harbor)
 - [Artifactory](#artifactory) (Pro)
 
+But first, a note about Kubeapps AppRepository resources:
+
+## Per Namespace App Repositories
+
+Previously, once an App Repository was created in Kubeapps, the charts indexed by that repository were then available cluster-wide to all Kubeapps users. This was changed in Kubeapps 1.10 to allow creating App Repositories that are available only in specific namespaces, which is more inline with the Kubernetes RBAC model where an account can have roles in specific namespaces. This change also enables Kubeapps to support deploying charts with images from private docker registries (more below).
+
+A Kubeapps AppRepository can be created by anyone with the required RBAC for that namespace. If you have cluster-wide RBAC for creating AppRepositories, you can still create an App Repository whose charts will be available to users in all namespaces by selecting "All Namespaces" when creating the repository.
+
+To give a specific user `USERNAME` the ability to create App Repositories in a specific namespace named `custom-namespace`, grant them both read and write RBAC for AppRepositories in that namespace:
+
+```bash
+kubectl -n custom-namespace create rolebinding username-apprepositories-read --user $USERNAME --clusterrole kubeapps:$KUBEAPPS_NAMESPACE:apprepositories-read
+kubectl -n custom-namespace create rolebinding username-apprepositories-write --user $USERNAME --clusterrole kubeapps:$KUBEAPPS_NAMESPACE:apprepositories-write
+```
+
+or to allow other users the ability to deploy charts from App Repositories in a specific namespace, grant the read access only.
+
+## Associating docker image pull secrets to an AppRepository - Helm 3 only
+
+When creating an AppRepository in Kubeapps, you can now additionally choose (or create) an [imagePullSecret](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod) to be associated with the AppRepository:
+
+<img src="../img/app-repo-pull-secret.png" alt="AppRepository with imagePullSecret" width="600px">
+
+When Kubeapps deploys any chart from this AppRepository, if a referenced docker image within the chart is from a docker registry server matching one of the secrets associated with the AppRepository, then Kubeapps with Helm 3 will automatically append the corresponding imagePullSecret so that image can be pulled from the private registry. Note that the user deploying the chart will need to be able to read secrets in that namespace, which is usually the case when deploying to a namespace.
+
+> **Note**: The automatic inclusion of associated image pull secrets is a feature specific to Helm 3. We do not intend to add support for this for Kubeapps configured with Helm 2.
+
+There will be further work to enable private AppRepositories to be available in multiple namespaces. Details about the design can be read on the [design document](https://docs.google.com/document/d/1YEeKC6nPLoq4oaxs9v8_UsmxrRfWxB6KCyqrh2-Q8x0/edit?ts=5e2adf87).
+
 ## ChartMuseum
 
 [ChartMuseum](https://chartmuseum.com) is an open-source Helm Chart Repository written in Go (Golang), with support for cloud storage backends, including Google Cloud Storage, Amazon S3, Microsoft Azure Blob Storage, Alibaba Cloud OSS Storage and OpenStack Object Storage.
@@ -43,7 +72,7 @@ curl --data-binary "@my-chart-1.0.0.tgz" http://localhost:8080/api/charts
 
 ### ChartMuseum: Configure the repository in Kubeapps
 
-To add your private repository go to `Configuration > App Repositories` in Kubeapps and click on "Add App Repository". You will need to add your repository using the Kubernetes DNS name for the ChartMuseum service. This will be `<release_name>-chartmuseum.<namespace>:8080`:
+To add your private repository to Kubeapps, select the Kubernetes namespace to which you want to add the repository (or "All Namespaces" if you want it available to users in all namespaces), go to `Configuration > App Repositories` and click on "Add App Repository". You will need to add your repository using the Kubernetes DNS name for the ChartMuseum service. This will be `<release_name>-chartmuseum.<namespace>:8080`:
 
 <img src="../img/chartmuseum-repository.png" alt="ChartMuseum App Repository" width="300px">
 
@@ -115,7 +144,7 @@ Please refer to ['Manage Helm Charts in Harbor'](https://github.com/goharbor/har
 
 ### Harbor: Configure the repository in Kubeapps
 
-To add Harbor as the private chart repository, go to `Configuration > App Repositories` in Kubeapps and click on "Add App Repository" and use the Harbor helm repository URL `http://harbor.default.svc.cluster.local/chartrepo/my-helm-repo`
+To add Harbor as the private chart repository in Kubeapps, select the Kubernetes namespace to which you want to add the repository (or "All Namespaces" if you want it available to users in all namespaces), go to `Configuration > App Repositories` and click on "Add App Repository" and use the Harbor helm repository URL `http://harbor.default.svc.cluster.local/chartrepo/my-helm-repo`
 
 <img src="../img/harbor-add-repo.png" width="600px">
 
@@ -169,7 +198,7 @@ curl -u{USER}:{PASSWORD} -XPOST "http://{REPO_URL}/artifactory/api/security/toke
 }
 ```
 
-The above command creates a token with read-only permissions. Now you can go to the `Configuration > App Repositories` menu and add your personal repository:
+The above command creates a token with read-only permissions. Now you can select the namespace to which you want to add the repository (or "All Namespaces" if you want it available to users in all namespaces), go to the `Configuration > App Repositories` menu and add your personal repository:
 
 <img src="../img/jfrog-custom-repo.png" alt="JFrog custom repository" width="400px">
 
@@ -199,9 +228,3 @@ spec:
 ```
 
 The above will generate a Pod with the label `my-repo: isPrivate` and the environment variable `FOO=BAR`.
-
-## Per Namespace App Repositories
-
-There is work in progress to support AppRepositories per namespace in Kubeapps, rather than sharing access to AppRepositories in Kubeapps' own namespace. Details about the design can be read on the [design document](https://docs.google.com/document/d/1YEeKC6nPLoq4oaxs9v8_UsmxrRfWxB6KCyqrh2-Q8x0/edit?ts=5e2adf87).
-
-More information will be added once it is available for general use.

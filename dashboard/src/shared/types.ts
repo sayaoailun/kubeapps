@@ -31,6 +31,7 @@ export class UnprocessableEntity extends CustomError {}
 export class InternalServerError extends CustomError {}
 
 export interface IRepo {
+  namespace: string;
   name: string;
   url: string;
 }
@@ -147,6 +148,28 @@ export interface IIngressTLS {
 export interface IIngressSpec {
   rules: IIngressRule[];
   tls?: IIngressTLS[];
+  backend?: {
+    serviceName: string;
+    servicePort: number;
+  };
+}
+
+export interface IResourceMetadata {
+  name: string;
+  namespace: string;
+  annotations: { [key: string]: string };
+  ownerReferences?: Array<{
+    apiVersion: string;
+    blockOwnerDeletion: string;
+    kind: string;
+    name: string;
+    uid: string;
+  }>;
+  creationTimestamp: string;
+  selfLink: string;
+  resourceVersion: string;
+  deletionTimestamp?: string;
+  uid: string;
 }
 
 export interface IResource {
@@ -155,16 +178,7 @@ export interface IResource {
   type: string;
   spec: any;
   status: any;
-  metadata: {
-    name: string;
-    namespace: string;
-    annotations: string;
-    creationTimestamp: string;
-    selfLink: string;
-    resourceVersion: string;
-    deletionTimestamp?: string;
-    uid: string;
-  };
+  metadata: IResourceMetadata;
 }
 
 export interface IOwnerReference {
@@ -180,16 +194,7 @@ export interface ISecret {
   kind: string;
   type: string;
   data: { [s: string]: string };
-  metadata: {
-    name: string;
-    namespace: string;
-    annotations: string;
-    creationTimestamp: string;
-    selfLink: string;
-    resourceVersion: string;
-    deletionTimestamp?: string;
-    uid: string;
-  };
+  metadata: IResourceMetadata;
 }
 
 export interface IDeploymentStatus {
@@ -213,6 +218,45 @@ export interface IRelease extends hapi.release.Release {
   updateInfo?: IChartUpdateInfo;
 }
 
+export interface IPackageManifestChannel {
+  name: string;
+  currentCSV: string;
+  currentCSVDesc: {
+    annotations: {
+      "alm-examples": string;
+      capabilities: string;
+      categories: string;
+      certified: string;
+      containerImage: string;
+      createdAt: string;
+      description: string;
+      repository: string;
+      support: string;
+    };
+    description: string;
+    displayName: string;
+    provider: {
+      name: string;
+    };
+    version: string;
+    installModes: [
+      { supported: boolean; type: "OwnNamespace" },
+      { supported: boolean; type: "SingleNamespace" },
+      { supported: boolean; type: "MultiNamespace" },
+      { supported: boolean; type: "AllNamespaces" },
+    ];
+    customresourcedefinitions: {
+      owned: Array<{
+        description: string;
+        displayName: string;
+        kind: string;
+        name: string;
+        version: string;
+      }>;
+    };
+  };
+}
+
 export interface IPackageManifestStatus {
   catalogSource: string;
   catalogSourceDisplayName: string;
@@ -221,48 +265,79 @@ export interface IPackageManifestStatus {
   provider: {
     name: string;
   };
-  channels: Array<{
-    name: string;
-    currentCSV: string;
-    currentCSVDesc: {
-      annotations: {
-        "alm-examples": string;
-        capabilities: string;
-        categories: string;
-        certified: string;
-        containerImage: string;
-        createdAt: string;
-        description: string;
-        repository: string;
-        support: string;
-      };
-      description: string;
-      displayName: string;
-      provider: {
-        name: string;
-      };
-      version: string;
-      installModes: [
-        { supported: boolean; type: "OwnNamespace" },
-        { supported: boolean; type: "SingleNamespace" },
-        { supported: boolean; type: "MultiNamespace" },
-        { supported: boolean; type: "AllNamespaces" },
-      ];
-      customresourcedefinitions: {
-        owned: Array<{
-          description: string;
-          displayName: string;
-          kind: string;
-          name: string;
-          version: string;
-        }>;
-      };
-    };
-  }>;
+  defaultChannel: string;
+  channels: IPackageManifestChannel[];
 }
 
 export interface IPackageManifest extends IResource {
   status: IPackageManifestStatus;
+}
+
+export interface IClusterServiceVersionCRDResource {
+  kind: string;
+  name: string;
+  version: string;
+}
+
+export interface IClusterServiceVersionCRD {
+  description: string;
+  displayName: string;
+  kind: string;
+  name: string;
+  version: string;
+  resources: IClusterServiceVersionCRDResource[];
+  specDescriptors: Array<{
+    description: string;
+    displayName: string;
+    path: string;
+    "x-descriptors": string[];
+  }>;
+  statusDescriptors: Array<{
+    description: string;
+    displayName: string;
+    path: string;
+    "x-descriptors": string[];
+  }>;
+}
+
+export interface IClusterServiceVersionSpec {
+  apiservicedefinitions: any;
+  customresourcedefinitions: {
+    owned: IClusterServiceVersionCRD[];
+  };
+  description: string;
+  displayName: string;
+  icon: Array<{
+    base64data: string;
+    mediatype: string;
+  }>;
+  install: any;
+  installModes: [
+    { supported: boolean; type: "OwnNamespace" },
+    { supported: boolean; type: "SingleNamespace" },
+    { supported: boolean; type: "MultiNamespace" },
+    { supported: boolean; type: "AllNamespaces" },
+  ];
+  keywords: string[];
+  labels: any;
+  links: Array<{
+    name: string;
+    url: string;
+  }>;
+  maintainers: Array<{
+    email: string;
+    name: string;
+  }>;
+  maturity: string;
+  provider: {
+    name: string;
+  };
+  selector: any;
+  version: string;
+}
+
+export interface IClusterServiceVersion extends IResource {
+  spec: IClusterServiceVersionSpec;
 }
 
 export interface IAppState {
@@ -334,7 +409,13 @@ export interface IAppRepository
       type: string;
       url: string;
       auth: {
-        header: {
+        header?: {
+          secretKeyRef: {
+            name: string;
+            key: string;
+          };
+        };
+        customCA?: {
           secretKeyRef: {
             name: string;
             key: string;
@@ -342,6 +423,8 @@ export interface IAppRepository
         };
       };
       resyncRequests: number;
+      syncJobPodTemplate?: object;
+      dockerRegistrySecrets?: string[];
     },
     undefined
   > {}
@@ -444,7 +527,7 @@ export interface IKubeItem<T> {
 }
 
 export interface IKubeState {
-  items: { [s: string]: IKubeItem<IResource> };
+  items: { [s: string]: IKubeItem<IResource | IK8sList<IResource, {}>> };
   sockets: { [s: string]: { socket: WebSocket; closeTimer: () => void } };
 }
 
