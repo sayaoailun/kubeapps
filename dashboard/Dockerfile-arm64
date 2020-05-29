@@ -1,0 +1,13 @@
+FROM node:8.9 AS build
+WORKDIR /app
+
+COPY package.json yarn.lock /app/
+RUN yarn config set proxy http://10.126.3.161:56000 && \
+    yarn config set https-proxy http://10.126.3.161:56000
+RUN yarn install --frozen-lockfile
+
+COPY . /app
+RUN yarn run build
+
+FROM nginx:1.17
+COPY --from=build /app/build /usr/share/nginx/html

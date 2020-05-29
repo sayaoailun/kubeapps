@@ -1,0 +1,5 @@
+FROM debian:10
+RUN echo "deb http://ftp2.cn.debian.org/debian/ stable main" > /etc/apt/sources.list
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY asset-syncer /asset-syncer
+CMD ["/asset-syncer"]
